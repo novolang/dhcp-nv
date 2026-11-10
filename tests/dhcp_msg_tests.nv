@@ -1,0 +1,323 @@
+// dhcp_msg_tests.nv — the message of RFC 2131, byte by byte: the header,
+// the options of RFC 2132, the overload of section 9.3, the long options
+// of RFC 3396, the faults a received message can have, and the builders.
+//
+// The vectors are written out by hand.  Each one names its fields beside
+// the bytes that carry them.
+
+use std.test
+use std.bytes
+use std.str
+use dhcpmsg
+
+// A message from hexadecimal text.
+fn load(hex: Str) -> Vec[u8; 576]
+    var m: Vec[u8; 576] = Vec.new()
+    for b in bytes.to_byte_list(bytes.from_hex(hex) ?? bytes.zeros(0))
+        let _p = m.push(b)
+    m
+
+// `n` zero bytes as hexadecimal text.
+fn zeros(n: Int) -> Str
+    "00".repeat(n)
+
+// The 236-byte header of a DHCPDISCOVER from the client 00:0b:82:01:fc:42,
+// transaction 0x3903F326, with the broadcast flag set.  `hops`, `secs`,
+// `siaddr` and `giaddr` are set to values a test can tell apart.
+//
+//   op 01, htype 01, hlen 06, hops 02
+//   xid 39 03 f3 26
+//   secs 00 07, flags 80 00
+//   ciaddr, yiaddr 0.0.0.0
+//   siaddr 10.1.2.3
+//   giaddr 0.0.0.0
+//   chaddr 00 0b 82 01 fc 42 and ten zero bytes
+//   sname 64 zero bytes, file 128 zero bytes
+fn header_hex() -> Str
+    "01010602" + "3903f326" + "0007" + "8000" + "00000000" + "00000000" + "0a010203" + "00000000" + "000b8201fc42" + zeros(10) + zeros(64) + zeros(128)
+
+// The cookie and the options of that DISCOVER: type 1, client identifier
+// (htype 1 and the address), requested address 192.168.0.10, a parameter
+// request list of 1, 3, 6, and END.
+fn discover_hex() -> Str
+    header_hex() + "63825363" + "350101" + "3d07" + "01000b8201fc42" + "3204c0a8000a" + "3703010306" + "ff"
+
+@test
+fn test_the_header_is_read_field_by_field() [io]
+    var m = load(discover_hex())
+    test.assert_eq(dhcpmsg.op(var m), 1)
+    test.assert_eq(dhcpmsg.htype(var m), 1)
+    test.assert_eq(dhcpmsg.hlen(var m), 6)
+    test.assert_eq(dhcpmsg.hops(var m), 2)
+    test.assert_eq(dhcpmsg.xid(var m), 0x3903F326)
+    test.assert_eq(dhcpmsg.secs(var m), 7)
+    test.assert_eq(dhcpmsg.flags(var m), 0x8000)
+    test.assert_eq(dhcpmsg.ciaddr(var m), 0)
+    test.assert_eq(dhcpmsg.yiaddr(var m), 0)
+    test.assert_eq(dhcpmsg.siaddr(var m), dhcpmsg.ip(10, 1, 2, 3))
+    test.assert_eq(dhcpmsg.giaddr(var m), 0)
+    test.assert_eq(m.len(), 240 + 3 + 9 + 6 + 5 + 1)
+
+    test.case("the hardware address is hlen bytes and then zeros")
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 0), 0x00)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 1), 0x0b)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 5), 0x42)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 6), 0)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, -1), 0)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 99), 0)
+
+    test.case("a message that stops early reads as zeros and does not fault")
+    var short = load("0101")
+    test.assert_eq(dhcpmsg.xid(var short), 0)
+    test.assert_eq(dhcpmsg.op(var short), 1)
+
+@test
+fn test_the_options_of_a_discover() [io]
+    var m = load(discover_hex())
+    test.assert_eq(dhcpmsg.validate(var m), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert_eq(dhcpmsg.message_type(var m), dhcpmsg.DHCP_DISCOVER)
+    test.assert_eq(dhcpmsg.option_u32(var m, dhcpmsg.DHCP_OPT_REQUESTED_IP), dhcpmsg.ip(192, 168, 0, 10))
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_CLIENT_ID), 7)
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_CLIENT_ID, 0), 1)
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_CLIENT_ID, 6), 0x42)
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_PARAMETER_LIST), 3)
+
+    test.case("an option that is absent is -1 in every reader")
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_ROUTER), -1)
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_ROUTER, 0), -1)
+    test.assert_eq(dhcpmsg.option_u8(var m, dhcpmsg.DHCP_OPT_ROUTER), -1)
+    test.assert_eq(dhcpmsg.option_u32(var m, dhcpmsg.DHCP_OPT_ROUTER), -1)
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_ROUTER, 0), -1)
+
+    test.case("a byte past the option, or before it, is -1")
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_CLIENT_ID, 7), -1)
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_CLIENT_ID, -1), -1)
+
+    test.case("a reader of the wrong width answers -1")
+    test.assert_eq(dhcpmsg.option_u8(var m, dhcpmsg.DHCP_OPT_REQUESTED_IP), -1)
+    test.assert_eq(dhcpmsg.option_u32(var m, dhcpmsg.DHCP_OPT_CLIENT_ID), -1)
+
+@test
+fn test_a_list_of_addresses_is_read_by_position() [io]
+    // Router 10.0.0.1 and 10.0.0.2, then a pad byte, then DNS 8.8.8.8, END, and
+    // an option after the END that must not be read.
+    var m = load(header_hex() + "63825363" + "350102" + "0308" + "0a000001" + "0a000002" + "00" + "0604" + "08080808" + "ff" + "0104ffffff00")
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_ROUTER, 0), dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_ROUTER, 1), dhcpmsg.ip(10, 0, 0, 2))
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_ROUTER, 2), -1)
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_ROUTER, -1), -1)
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_DNS, 0), dhcpmsg.ip(8, 8, 8, 8))
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_SUBNET_MASK), -1)
+
+    test.case("a list whose length is not a multiple of four is -1")
+    var odd = load(header_hex() + "63825363" + "350102" + "0305" + "0a00000102" + "ff")
+    test.assert_eq(dhcpmsg.option_ip(var odd, dhcpmsg.DHCP_OPT_ROUTER, 0), -1)
+
+@test
+fn test_an_option_with_no_data_is_present_and_empty() [io]
+    var m = load(header_hex() + "63825363" + "350101" + "3c00" + "ff")
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_VENDOR_CLASS), 0)
+    test.assert_eq(dhcpmsg.option_byte(var m, dhcpmsg.DHCP_OPT_VENDOR_CLASS, 0), -1)
+
+@test
+fn test_the_overload_moves_options_into_file_and_sname() [io]
+    // RFC 2132 section 9.3: option 52 value 1 says `file` holds options,
+    // 2 says `sname` does, 3 says both.  The router is in `file` and the
+    // DNS server in `sname`.
+    let file_opts = "0304" + "0a000001" + "ff"
+    let sname_opts = "0604" + "08080404" + "ff"
+    let file_area = file_opts + zeros(128 - 7)
+    let sname_area = sname_opts + zeros(64 - 7)
+    let head = "01010600" + "00000001" + "0000" + "0000" + zeros(16) + "000b8201fc42" + zeros(10)
+
+    test.case("1: the file area is read")
+    var f = load(head + sname_area.replace("08080404", "00000000") + file_area + "63825363" + "350101" + "340101" + "ff")
+    test.assert_eq(dhcpmsg.option_ip(var f, dhcpmsg.DHCP_OPT_ROUTER, 0), dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(dhcpmsg.validate(var f), dhcpmsg.DHCP_FAULT_NONE)
+
+    test.case("2: the sname area is read")
+    var s = load(head + sname_area + zeros(128) + "63825363" + "350101" + "340102" + "ff")
+    test.assert_eq(dhcpmsg.option_ip(var s, dhcpmsg.DHCP_OPT_DNS, 0), dhcpmsg.ip(8, 8, 4, 4))
+    test.assert_eq(dhcpmsg.option_ip(var s, dhcpmsg.DHCP_OPT_ROUTER, 0), -1)
+
+    test.case("3: both are read")
+    var b = load(head + sname_area + file_area + "63825363" + "350101" + "340103" + "ff")
+    test.assert_eq(dhcpmsg.option_ip(var b, dhcpmsg.DHCP_OPT_ROUTER, 0), dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(dhcpmsg.option_ip(var b, dhcpmsg.DHCP_OPT_DNS, 0), dhcpmsg.ip(8, 8, 4, 4))
+
+    test.case("without the overload option the two areas are not options")
+    var n = load(head + sname_area + file_area + "63825363" + "350101" + "ff")
+    test.assert_eq(dhcpmsg.option_ip(var n, dhcpmsg.DHCP_OPT_ROUTER, 0), -1)
+    test.assert_eq(dhcpmsg.option_ip(var n, dhcpmsg.DHCP_OPT_DNS, 0), -1)
+
+@test
+fn test_an_option_in_pieces_is_one_value() [io]
+    // RFC 3396: two instances of an option are one value, joined in the
+    // order they appear.  The DNS option is 6.6.6.6 and 7.7.7.7 here,
+    // split in the middle of the second address.
+    var m = load(header_hex() + "63825363" + "350102" + "0606" + "060606060707" + "0602" + "0707" + "ff")
+    test.assert_eq(dhcpmsg.option_len(var m, dhcpmsg.DHCP_OPT_DNS), 8)
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_DNS, 0), dhcpmsg.ip(6, 6, 6, 6))
+    test.assert_eq(dhcpmsg.option_ip(var m, dhcpmsg.DHCP_OPT_DNS, 1), dhcpmsg.ip(7, 7, 7, 7))
+
+    test.case("a piece in the file area joins the pieces of the options field")
+    let file_area = "0602" + "0707" + "ff" + zeros(128 - 5)
+    var o = load("01010600" + "00000001" + "0000" + "0000" + zeros(16) + "000b8201fc42" + zeros(10) + zeros(64) + file_area + "63825363" + "350102" + "0606" + "060606060707" + "340101" + "ff")
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_DNS), 8)
+    test.assert_eq(dhcpmsg.option_ip(var o, dhcpmsg.DHCP_OPT_DNS, 1), dhcpmsg.ip(7, 7, 7, 7))
+
+@test
+fn test_a_received_message_is_checked() [io]
+    test.case("a good message")
+    var good = load(discover_hex())
+    test.assert_eq(dhcpmsg.validate(var good), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert(not dhcpmsg.options_malformed(var good))
+
+    test.case("shorter than a header, a cookie and an option")
+    var short = load(header_hex() + "63825363")
+    test.assert_eq(dhcpmsg.validate(var short), dhcpmsg.DHCP_FAULT_SHORT)
+
+    test.case("an op that is neither 1 nor 2")
+    var op = load(discover_hex().replace("01010602", "03010602"))
+    test.assert_eq(dhcpmsg.validate(var op), dhcpmsg.DHCP_FAULT_OP)
+
+    test.case("a hardware address longer than the field")
+    var hl = load(discover_hex().replace("01010602", "01011102"))
+    test.assert_eq(dhcpmsg.validate(var hl), dhcpmsg.DHCP_FAULT_HLEN)
+
+    test.case("a cookie that is not the magic one")
+    var ck = load(discover_hex().replace("63825363", "63825364"))
+    test.assert_eq(dhcpmsg.validate(var ck), dhcpmsg.DHCP_FAULT_COOKIE)
+
+    test.case("an option that runs past the end of the message")
+    var run = load(header_hex() + "63825363" + "350101" + "3204c0a8")
+    test.assert_eq(dhcpmsg.validate(var run), dhcpmsg.DHCP_FAULT_OPTION)
+    test.assert(dhcpmsg.options_malformed(var run))
+
+    test.case("an option code with no length byte")
+    var lone = load(header_hex() + "63825363" + "350101" + "32")
+    test.assert_eq(dhcpmsg.validate(var lone), dhcpmsg.DHCP_FAULT_OPTION)
+
+    test.case("no message type: a BOOTP message")
+    var bootp = load(header_hex() + "63825363" + "0104ffffff00" + "ff")
+    test.assert_eq(dhcpmsg.validate(var bootp), dhcpmsg.DHCP_FAULT_NO_TYPE)
+
+@test
+fn test_every_fault_and_every_type_has_a_name() [io]
+    for f in 0..7
+        test.assert(str.len(dhcpmsg.fault_name(f)) > 6)
+    test.assert_eq(dhcpmsg.fault_name(99), "unknown fault")
+    test.assert_eq(dhcpmsg.fault_name(dhcpmsg.DHCP_FAULT_NONE), "no fault")
+    let names = ["DHCPDISCOVER",
+        "DHCPOFFER",
+        "DHCPREQUEST",
+        "DHCPDECLINE",
+        "DHCPACK",
+        "DHCPNAK",
+        "DHCPRELEASE",
+        "DHCPINFORM"]
+    for t in 1..9
+        test.assert_eq(dhcpmsg.type_name(t), names[t - 1])
+    test.assert_eq(dhcpmsg.type_name(0), "unknown message type")
+
+@test
+fn test_addresses_are_four_octets_in_one_integer() [io]
+    test.assert_eq(dhcpmsg.ip(192, 168, 1, 10), 0xC0A8010A)
+    test.assert_eq(dhcpmsg.ip(255, 255, 255, 255), dhcpmsg.DHCP_BROADCAST)
+    test.assert_eq(dhcpmsg.ip(256, 0, 0, 1), dhcpmsg.ip(0, 0, 0, 1))
+    test.assert_eq(dhcpmsg.ip_octet(0xC0A8010A, 0), 192)
+    test.assert_eq(dhcpmsg.ip_octet(0xC0A8010A, 1), 168)
+    test.assert_eq(dhcpmsg.ip_octet(0xC0A8010A, 2), 1)
+    test.assert_eq(dhcpmsg.ip_octet(0xC0A8010A, 3), 10)
+
+@test
+fn test_a_message_is_built_to_the_bytes_of_the_rfc() [io]
+    // The DISCOVER of `discover_hex`, built with the writers.
+    var mac: Vec[u8; 16] = Vec.new()
+    for b in [0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42]
+        let _p = mac.push(b as u8)
+    var m: Vec[u8; 576] = Vec.new()
+    var ok = dhcpmsg.begin(var m, 1, 1, var mac, 0x3903F326, 0, 0x8000, 0, 0, 0)
+    test.assert(ok)
+    test.assert_eq(m.len(), 240)
+    test.assert_eq(dhcpmsg.xid(var m), 0x3903F326)
+    test.assert_eq(dhcpmsg.hlen(var m), 6)
+    test.assert_eq(dhcpmsg.chaddr_byte(var m, 5), 0x42)
+    test.assert_eq(dhcpmsg.flags(var m), 0x8000)
+
+    test.case("options are appended in the order written")
+    test.assert(dhcpmsg.put_option_u8(var m, 53, 1))
+    test.assert(dhcpmsg.put_option_u16(var m, 57, 576))
+    test.assert(dhcpmsg.put_option_u32(var m, 50, dhcpmsg.ip(192, 168, 0, 10)))
+    var want: Vec[u8; 32] = Vec.new()
+    for c in [1, 3, 6]
+        let _w = want.push(c as u8)
+    test.assert(dhcpmsg.put_option_bytes(var m, 55, var want))
+    test.assert_eq(m[240], 53 as u8)
+    test.assert_eq(m[241], 1 as u8)
+    test.assert_eq(dhcpmsg.option_u8(var m, 53), 1)
+    test.assert_eq(dhcpmsg.option_len(var m, 57), 2)
+    test.assert_eq(dhcpmsg.option_byte(var m, 57, 0), 2)
+    test.assert_eq(dhcpmsg.option_byte(var m, 57, 1), 0x40)
+    test.assert_eq(dhcpmsg.option_u32(var m, 50), 0xC0A8000A)
+    test.assert_eq(dhcpmsg.option_len(var m, 55), 3)
+
+    test.case("an empty option is written with a length of zero")
+    var none: Vec[u8; 32] = Vec.new()
+    test.assert(dhcpmsg.put_option_bytes(var m, 60, var none))
+    test.assert_eq(dhcpmsg.option_len(var m, 60), 0)
+
+    test.case("finish ends the options and pads to 300 bytes")
+    test.assert(dhcpmsg.finish(var m))
+    test.assert_eq(m.len(), 300)
+    test.assert_eq(dhcpmsg.validate(var m), dhcpmsg.DHCP_FAULT_NONE)
+
+    test.case("the same message, byte for byte, as the one written by hand")
+    var by_hand = load(discover_hex().replace("3d07" + "01000b8201fc42", ""))
+    test.assert_eq(dhcpmsg.xid(var by_hand), dhcpmsg.xid(var m))
+    test.assert_eq(dhcpmsg.option_u32(var by_hand, 50), dhcpmsg.option_u32(var m, 50))
+
+    test.case("a message with a message longer than the hardware address field is refused by reading, not by writing")
+    var long_mac: Vec[u8; 16] = Vec.new()
+    for i in 0..16
+        let _p = long_mac.push(i as u8)
+    ok = dhcpmsg.begin(var m, 1, 1, var long_mac, 1, 0, 0, 0, 0, 0)
+    test.assert(ok)
+    test.assert_eq(dhcpmsg.hlen(var m), 16)
+
+@test
+fn test_a_full_buffer_refuses_instead_of_overflowing() [io]
+    var mac: Vec[u8; 16] = Vec.new()
+    var m: Vec[u8; 576] = Vec.new()
+    test.assert(dhcpmsg.begin(var m, 1, 1, var mac, 1, 0, 0, 0, 0, 0))
+    var big: Vec[u8; 32] = Vec.new()
+    for _ in 0..30
+        let _p = big.push(7 as u8)
+    var ok = true
+    for _ in 0..10
+        ok = dhcpmsg.put_option_bytes(var m, 60, var big)
+    test.assert(ok)
+    test.assert_eq(m.len(), 240 + 10 * 32)
+    test.case("the buffer holds 576 bytes and then the writers answer false")
+    ok = dhcpmsg.put_option_bytes(var m, 60, var big)
+    test.assert(not ok)
+    test.assert_eq(m.len(), 576)
+    test.assert(not dhcpmsg.put_option_u8(var m, 53, 1))
+    test.assert(not dhcpmsg.put_option_u16(var m, 57, 1))
+    test.assert(not dhcpmsg.put_option_u32(var m, 50, 1))
+    test.assert(not dhcpmsg.finish(var m))
+
+@test
+fn test_the_hardware_address_is_copied_out_of_a_message() [io]
+    var m = load(discover_hex())
+    var mac: Vec[u8; 16] = Vec.new()
+    let _p = mac.push(9 as u8)
+    dhcpmsg.read_chaddr(var m, var mac)
+    test.assert_eq(mac.len(), 6)
+    test.assert_eq(mac[0], 0 as u8)
+    test.assert_eq(mac[5], 0x42 as u8)
+
+    test.case("a length over sixteen copies sixteen")
+    var odd = load(discover_hex().replace("01010602", "01011002"))
+    dhcpmsg.read_chaddr(var odd, var mac)
+    test.assert_eq(mac.len(), 16)

@@ -1,0 +1,34 @@
+[package]
+name        = "dhcp-nv"
+version     = "0.1.0"
+description = "DHCPv4 (RFC 2131 and RFC 2132) for a device with no heap: the 576-byte message in a fixed buffer, the options with the overload and long-option rules, the client's six states with T1 and T2 as times the caller supplies, lease handling, and the answer builder of a server with a small static pool.  DHCPv6 is not included."
+license     = "Apache-2.0"
+
+stability   = "experimental"
+
+# `core`, and every module is `@tier(embedded)` and `@no_alloc`.  A
+# message is a `Vec[u8; 576]` in the caller's frame and a client or a
+# server is a `@value` struct; there is no list, no string built at run
+# time and no `Result` that carries a payload.  Nothing performs: the
+# datagram the caller reads goes in, the datagram to write comes out,
+# and the clock is a number the caller passes.
+#
+# `tests/embedded_probe.nv` is the claim as a program: a client and a
+# server linked for `--target=nrf52-qemu` that run an exchange to a
+# bound lease and print `PASS: dhcp-embedded`.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["dhcp", "dhcpv4", "rfc2131", "rfc2132", "bootp", "lease", "sans-io", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/dhcp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A lease for a device that has no heap"
+
+[dependencies]

@@ -1,0 +1,568 @@
+// dhcpclient.nv — the client of RFC 2131 section 4.4 as a value the
+// caller steps: the states INIT, SELECTING, REQUESTING, BOUND, RENEWING
+// and REBINDING, the retransmission schedule, and the lease with its
+// two timers.
+//
+// The client performs nothing.  Time is a number of seconds the caller
+// reads from its own clock and passes to every call; the same goes for
+// the random word that picks a transaction identifier and spreads
+// retransmissions.  A datagram that arrives is a `Vec[u8; 576]` handed
+// to `client_receive`, and a datagram to send is built in a `Vec[u8;
+// 576]` the caller gives, with the return value saying where to send it.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`.
+//
+// The caller's loop is two calls:
+//
+//   action = client_tick(c, now, random, out)   // when `client_next_at` passes
+//   action = client_receive(c, now, in, out)    // when a datagram arrives
+//
+// and the action says what to do next.
+
+use dhcpmsg
+
+// ── States (RFC 2131 figure 5) ──────────────────────────────────────
+
+// No lease and no exchange in progress.
+pub const DHCP_STATE_INIT = 0
+// A DHCPDISCOVER is out; the client waits for offers.
+pub const DHCP_STATE_SELECTING = 1
+// A DHCPREQUEST for an offered address is out.
+pub const DHCP_STATE_REQUESTING = 2
+// The client holds a lease and is waiting for T1.
+pub const DHCP_STATE_BOUND = 3
+// T1 has passed; the client asks its server to extend the lease.
+pub const DHCP_STATE_RENEWING = 4
+// T2 has passed; the client asks any server to extend the lease.
+pub const DHCP_STATE_REBINDING = 5
+
+// ── Actions ─────────────────────────────────────────────────────────
+
+// Nothing to do.
+pub const DHCP_ACT_NONE = 0
+// Write the message built in `out` to 255.255.255.255 port 67, from port
+// 68.  The source address is 0.0.0.0, or the leased address when the
+// client is rebinding.
+pub const DHCP_ACT_BROADCAST = 1
+// Write the message built in `out` to the server at `client_server`, port
+// 67, from the leased address.
+pub const DHCP_ACT_UNICAST = 2
+// A lease was granted or extended.  Nothing is written.  The address,
+// mask, router and DNS servers are in the client.
+pub const DHCP_ACT_BOUND = 3
+// The server refused the client's request: the address must not be used.
+// The client is back in INIT and starts again on its next tick.
+pub const DHCP_ACT_NAK = 4
+// The lease ended with no server having extended it.  The address must
+// not be used.  The client is back in INIT.
+pub const DHCP_ACT_EXPIRED = 5
+
+// How many transmissions of a DHCPREQUEST are made before the client
+// gives up on an offer and starts again from INIT (RFC 2131 section
+// 4.4.1 asks for a bounded number).
+pub const DHCP_MAX_REQUESTS = 5
+
+// The shortest wait between retransmissions of a renewing or rebinding
+// DHCPREQUEST, in seconds (RFC 2131 section 4.4.5).
+pub const DHCP_MIN_RENEW_WAIT = 60
+
+// The wait after a DHCPDECLINE before the client starts again, in
+// seconds (RFC 2131 section 3.1 item 5).
+pub const DHCP_DECLINE_WAIT = 10
+
+// The state of one client and its lease.
+pub @value
+struct DhcpClient
+    state: Int
+    // The transaction identifier of the exchange in progress.
+    xid: Int
+    // When the exchange began, for the `secs` field.
+    began: Int
+    // How many times the current message has been sent.
+    attempts: Int
+    // The time of the next retransmission or change of state.
+    next_at: Int
+    // The address offered, while REQUESTING.
+    offered: Int
+    // The identifier of the server that granted the lease.
+    server: Int
+    // The leased address, 0 when there is none.
+    ip: Int
+    // The lease's options.  A value of 0 means the server sent none.
+    mask: Int
+    router: Int
+    dns1: Int
+    dns2: Int
+    // The lease in seconds, with its two timers, as offsets from `bound_at`.
+    lease_secs: Int
+    t1_secs: Int
+    t2_secs: Int
+    // When the lease was granted or last extended.
+    bound_at: Int
+    // The hardware type, and whether to ask the server to broadcast its
+    // answers to a client that has no address yet.
+    hardware_type: Int
+    broadcast: Bool
+    mac: Vec[u8; 16]
+
+// A client in INIT that identifies itself by `mac`, one to sixteen
+// bytes of hardware address.  The first `client_tick` starts an
+// exchange.  `hardware_type` is 1 for Ethernet.  `broadcast` asks
+// servers to answer by broadcast, which a client that cannot receive a
+// unicast datagram before it has an address needs (RFC 2131 section
+// 4.1).
+pub @tier(embedded)
+@no_alloc
+fn client_new(var mac: Vec[u8; 16], hardware_type: Int, broadcast: Bool) -> DhcpClient
+    var c = DhcpClient { state: DHCP_STATE_INIT, xid: 0, began: 0, attempts: 0, next_at: 0,
+                         offered: 0, server: 0, ip: 0, mask: 0, router: 0, dns1: 0, dns2: 0,
+                         lease_secs: 0, t1_secs: 0, t2_secs: 0, bound_at: 0,
+                         hardware_type: hardware_type, broadcast: broadcast, mac: Vec.new() }
+    for i in 0..mac.len()
+        let _p = c.mac.push(mac[i])
+    c
+
+// ── Reading the client ──────────────────────────────────────────────
+
+// The state, one of `DHCP_STATE_*`.
+pub @tier(embedded)
+@no_alloc
+fn client_state(var c: DhcpClient) -> Int
+    c.state
+
+// Whether the client holds a lease it may use.
+pub @tier(embedded)
+@no_alloc
+fn client_has_lease(var c: DhcpClient) -> Bool
+    c.state >= DHCP_STATE_BOUND
+
+// The leased address, or 0.
+pub @tier(embedded)
+@no_alloc
+fn client_ip(var c: DhcpClient) -> Int
+    c.ip
+
+// The server that granted the lease, and the one a unicast goes to.
+pub @tier(embedded)
+@no_alloc
+fn client_server(var c: DhcpClient) -> Int
+    c.server
+
+// Whether the lease never ends.
+pub @tier(embedded)
+@no_alloc
+fn client_lease_is_infinite(var c: DhcpClient) -> Bool
+    c.lease_secs == dhcpmsg.DHCP_INFINITE
+
+// When the client wants its next tick, in the caller's seconds, or -1
+// when nothing is pending: a client bound to a lease that never ends.
+pub @tier(embedded)
+@no_alloc
+fn client_next_at(var c: DhcpClient) -> Int
+    if c.state == DHCP_STATE_BOUND
+        if client_lease_is_infinite(var c)
+            -1
+        else
+            c.bound_at + c.t1_secs
+    else
+        c.next_at
+
+// When T1 passes: the time the client starts renewing.
+pub @tier(embedded)
+@no_alloc
+fn client_t1_at(var c: DhcpClient) -> Int
+    c.bound_at + c.t1_secs
+
+// When T2 passes: the time the client starts rebinding.
+pub @tier(embedded)
+@no_alloc
+fn client_t2_at(var c: DhcpClient) -> Int
+    c.bound_at + c.t2_secs
+
+// When the lease ends.
+pub @tier(embedded)
+@no_alloc
+fn client_expires_at(var c: DhcpClient) -> Int
+    c.bound_at + c.lease_secs
+
+// Seconds of lease left at `now`, or 0 when there is no lease or it has
+// ended.
+pub @tier(embedded)
+@no_alloc
+fn client_remaining(var c: DhcpClient, now: Int) -> Int
+    if c.state < DHCP_STATE_BOUND or now >= client_expires_at(var c)
+        0
+    else
+        client_expires_at(var c) - now
+
+// ── Building messages ───────────────────────────────────────────────
+
+// The seconds since the exchange began, as the 16-bit `secs` field
+// holds them.
+@tier(embedded)
+@no_alloc
+fn elapsed(var c: DhcpClient, now: Int) -> Int
+    if now <= c.began
+        0
+    elif now - c.began > 65535
+        65535
+    else
+        now - c.began
+
+// The options every client message carries after its type: the client
+// identifier (htype and hardware address), the largest message the
+// client accepts, and the parameter request list.
+@tier(embedded)
+@no_alloc
+fn put_common_options(var out: Vec[u8; 576], var c: DhcpClient) -> Bool
+    var id: Vec[u8; 32] = Vec.new()
+    let _t = id.push(c.hardware_type as u8)
+    for i in 0..c.mac.len()
+        let _b = id.push(c.mac[i])
+    var want: Vec[u8; 32] = Vec.new()
+    let _1 = want.push(dhcpmsg.DHCP_OPT_SUBNET_MASK as u8)
+    let _2 = want.push(dhcpmsg.DHCP_OPT_ROUTER as u8)
+    let _3 = want.push(dhcpmsg.DHCP_OPT_DNS as u8)
+    let _4 = want.push(dhcpmsg.DHCP_OPT_LEASE_TIME as u8)
+    let _5 = want.push(dhcpmsg.DHCP_OPT_RENEWAL as u8)
+    let _6 = want.push(dhcpmsg.DHCP_OPT_REBINDING as u8)
+    dhcpmsg.put_option_bytes(var out, dhcpmsg.DHCP_OPT_CLIENT_ID, var id)
+        and dhcpmsg.put_option_u16(var out, dhcpmsg.DHCP_OPT_MAX_MESSAGE, dhcpmsg.DHCP_MESSAGE_MAX)
+        and dhcpmsg.put_option_bytes(var out, dhcpmsg.DHCP_OPT_PARAMETER_LIST, var want)
+
+// A DHCPDISCOVER (RFC 2131 section 4.4.1).
+@tier(embedded)
+@no_alloc
+fn build_discover(var c: DhcpClient, now: Int, var out: Vec[u8; 576]) -> Bool
+    var flag_bits = 0
+    if c.broadcast
+        flag_bits = dhcpmsg.DHCP_FLAG_BROADCAST
+    dhcpmsg.begin(var out,
+        dhcpmsg.DHCP_BOOTREQUEST,
+        c.hardware_type,
+        var c.mac,
+        c.xid,
+        elapsed(var c, now),
+        flag_bits,
+        0,
+        0,
+        0)
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_DISCOVER)
+        and put_common_options(var out, var c)
+        and dhcpmsg.finish(var out)
+
+// A DHCPREQUEST that answers an offer: it names the server and the
+// address (RFC 2131 section 4.3.2, SELECTING).
+@tier(embedded)
+@no_alloc
+fn build_select_request(var c: DhcpClient, now: Int, var out: Vec[u8; 576]) -> Bool
+    var flag_bits = 0
+    if c.broadcast
+        flag_bits = dhcpmsg.DHCP_FLAG_BROADCAST
+    dhcpmsg.begin(var out,
+        dhcpmsg.DHCP_BOOTREQUEST,
+        c.hardware_type,
+        var c.mac,
+        c.xid,
+        elapsed(var c, now),
+        flag_bits,
+        0,
+        0,
+        0)
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_REQUEST)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_REQUESTED_IP, c.offered)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID, c.server)
+        and put_common_options(var out, var c)
+        and dhcpmsg.finish(var out)
+
+// A DHCPREQUEST that extends a lease: the leased address is in `ciaddr`,
+// and neither the server nor the address is named (RFC 2131 section
+// 4.3.2, RENEWING and REBINDING).
+@tier(embedded)
+@no_alloc
+fn build_renew_request(var c: DhcpClient, now: Int, var out: Vec[u8; 576]) -> Bool
+    dhcpmsg.begin(var out,
+        dhcpmsg.DHCP_BOOTREQUEST,
+        c.hardware_type,
+        var c.mac,
+        c.xid,
+        elapsed(var c, now),
+        0,
+        c.ip,
+        0,
+        0)
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_REQUEST)
+        and put_common_options(var out, var c)
+        and dhcpmsg.finish(var out)
+
+// ── Timing ──────────────────────────────────────────────────────────
+
+// The wait before the next transmission of a message that has been sent
+// `attempts` times: 4 seconds, doubling to 64, spread by up to one
+// second either way (RFC 2131 section 4.1).
+@tier(embedded)
+@no_alloc
+fn retry_delay(attempts: Int, random: Int) -> Int
+    var base = 4
+    for _ in 1..attempts
+        if base < 64
+            base = base * 2
+    base + (random & 0xFFFF) % 3 - 1
+
+// The wait before a renewing or rebinding client sends again: half the
+// time left until `until`, and at least 60 seconds (RFC 2131 section
+// 4.4.5).
+@tier(embedded)
+@no_alloc
+fn renew_delay(now: Int, until: Int) -> Int
+    let half = (until - now) / 2
+    if half < DHCP_MIN_RENEW_WAIT
+        DHCP_MIN_RENEW_WAIT
+    else
+        half
+
+// Set the three timers from what the ACK said.  A T1 or T2 that is
+// missing, or that does not satisfy T1 < T2 < lease, is replaced by the
+// default of half and seven eighths of the lease (RFC 2131 section
+// 4.5).
+@tier(embedded)
+@no_alloc
+fn set_timers(var c: DhcpClient, lease: Int, t1: Int, t2: Int)
+    c.lease_secs = lease
+    if lease == dhcpmsg.DHCP_INFINITE
+        c.t1_secs = dhcpmsg.DHCP_INFINITE
+        c.t2_secs = dhcpmsg.DHCP_INFINITE
+    elif t1 > 0 and t2 > t1 and t2 < lease
+        c.t1_secs = t1
+        c.t2_secs = t2
+    else
+        c.t1_secs = lease / 2
+        c.t2_secs = lease * 7 / 8
+
+// ── Stepping ────────────────────────────────────────────────────────
+
+// Go back to INIT with no lease, to start again at `when`.
+@tier(embedded)
+@no_alloc
+fn reset(var c: DhcpClient, when: Int)
+    c.state = DHCP_STATE_INIT
+    c.ip = 0
+    c.offered = 0
+    c.attempts = 0
+    c.next_at = when
+
+// The client's timers, called when `client_next_at` passes and at any
+// other time (a call before it does nothing).
+//
+// `random` is a random 32-bit word from the caller: it becomes the
+// transaction identifier of a new exchange and spreads the
+// retransmissions.  Answers an action; for `DHCP_ACT_BROADCAST` and
+// `DHCP_ACT_UNICAST` the datagram to write is in `out`.
+//
+// - INIT starts an exchange with a DHCPDISCOVER.
+// - SELECTING and REQUESTING send again with a doubling wait.
+//   REQUESTING gives up after `DHCP_MAX_REQUESTS` and starts again.
+// - BOUND moves to RENEWING at T1 and sends a DHCPREQUEST to the server.
+// - RENEWING moves to REBINDING at T2 and broadcasts.
+// - REBINDING ends the lease when it expires.
+pub @tier(embedded)
+@no_alloc
+fn client_tick(var c: DhcpClient, now: Int, random: Int, var out: Vec[u8; 576]) -> Int
+    if c.state == DHCP_STATE_INIT
+        if now >= c.next_at
+            c.xid = random & 0xFFFFFFFF
+            c.began = now
+            c.attempts = 1
+            c.state = DHCP_STATE_SELECTING
+            c.next_at = now + retry_delay(1, random)
+            if build_discover(var c, now, var out)
+                return DHCP_ACT_BROADCAST
+    elif c.state == DHCP_STATE_SELECTING
+        if now >= c.next_at
+            c.attempts = c.attempts + 1
+            c.next_at = now + retry_delay(c.attempts, random)
+            if build_discover(var c, now, var out)
+                return DHCP_ACT_BROADCAST
+    elif c.state == DHCP_STATE_REQUESTING
+        if now >= c.next_at
+            if c.attempts >= DHCP_MAX_REQUESTS
+                reset(var c, now)
+            else
+                c.attempts = c.attempts + 1
+                c.next_at = now + retry_delay(c.attempts, random)
+                if build_select_request(var c, now, var out)
+                    return DHCP_ACT_BROADCAST
+    elif c.state == DHCP_STATE_BOUND
+        if not client_lease_is_infinite(var c) and now >= client_t1_at(var c)
+            c.state = DHCP_STATE_RENEWING
+            c.xid = random & 0xFFFFFFFF
+            c.began = now
+            c.attempts = 1
+            c.next_at = now + renew_delay(now, client_t2_at(var c))
+            if build_renew_request(var c, now, var out)
+                return DHCP_ACT_UNICAST
+    elif c.state == DHCP_STATE_RENEWING
+        if now >= client_t2_at(var c)
+            c.state = DHCP_STATE_REBINDING
+            c.next_at = now + renew_delay(now, client_expires_at(var c))
+            if build_renew_request(var c, now, var out)
+                return DHCP_ACT_BROADCAST
+        elif now >= c.next_at
+            c.next_at = now + renew_delay(now, client_t2_at(var c))
+            if build_renew_request(var c, now, var out)
+                return DHCP_ACT_UNICAST
+    else
+        if now >= client_expires_at(var c)
+            reset(var c, now)
+            return DHCP_ACT_EXPIRED
+        elif now >= c.next_at
+            c.next_at = now + renew_delay(now, client_expires_at(var c))
+            if build_renew_request(var c, now, var out)
+                return DHCP_ACT_BROADCAST
+    DHCP_ACT_NONE
+
+// Whether a received message belongs to the exchange in progress: a
+// reply, with this client's transaction identifier and hardware address.
+@tier(embedded)
+@no_alloc
+fn is_for_me(var c: DhcpClient, var msg: Vec[u8; 576]) -> Bool
+    var same = dhcpmsg.validate(var msg) == dhcpmsg.DHCP_FAULT_NONE
+        and dhcpmsg.op(var msg) == dhcpmsg.DHCP_BOOTREPLY
+        and dhcpmsg.xid(var msg) == c.xid
+        and dhcpmsg.hlen(var msg) == c.mac.len()
+    for i in 0..c.mac.len()
+        if dhcpmsg.chaddr_byte(var msg, i) != (c.mac[i] as Int)
+            same = false
+    same
+
+// Take the lease an ACK grants.  Answers false, and changes nothing,
+// when the ACK carries no lease time or no address.
+@tier(embedded)
+@no_alloc
+fn accept_ack(var c: DhcpClient, now: Int, var msg: Vec[u8; 576]) -> Bool
+    let lease = dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_LEASE_TIME)
+    let your = dhcpmsg.yiaddr(var msg)
+    if lease <= 0 or your == 0
+        return false
+    let server = dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_SERVER_ID)
+    if server > 0
+        c.server = server
+    c.ip = your
+    c.mask = max_zero(dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_SUBNET_MASK))
+    c.router = max_zero(dhcpmsg.option_ip(var msg, dhcpmsg.DHCP_OPT_ROUTER, 0))
+    c.dns1 = max_zero(dhcpmsg.option_ip(var msg, dhcpmsg.DHCP_OPT_DNS, 0))
+    c.dns2 = max_zero(dhcpmsg.option_ip(var msg, dhcpmsg.DHCP_OPT_DNS, 1))
+    set_timers(var c,
+        lease,
+        dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_RENEWAL),
+        dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_REBINDING))
+    c.bound_at = now
+    c.attempts = 0
+    c.state = DHCP_STATE_BOUND
+    true
+
+// A value read from an option, or 0 when the option was absent.
+@tier(embedded)
+@no_alloc
+fn max_zero(v: Int) -> Int
+    if v < 0
+        0
+    else
+        v
+
+// A datagram arrived from the network.
+//
+// A message that is not an answer to this client's exchange, or that
+// does not fit the state, is ignored and answers `DHCP_ACT_NONE`.
+//
+// - SELECTING takes the first DHCPOFFER, sends a DHCPREQUEST for it, and
+//   answers `DHCP_ACT_BROADCAST`.
+// - REQUESTING, RENEWING and REBINDING take a DHCPACK, move to BOUND and
+//   answer `DHCP_ACT_BOUND`, and take a DHCPNAK, move to INIT and
+//   answer `DHCP_ACT_NAK`.  A DHCPNAK that names a server other than
+//   the one the client is talking to is ignored, so that a forged one
+//   cannot end a lease.
+pub @tier(embedded)
+@no_alloc
+fn client_receive(var c: DhcpClient, now: Int, var msg: Vec[u8; 576], var out: Vec[u8; 576]) -> Int
+    if not is_for_me(var c, var msg)
+        return DHCP_ACT_NONE
+    let kind = dhcpmsg.message_type(var msg)
+    if c.state == DHCP_STATE_SELECTING
+        let server = dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_SERVER_ID)
+        if kind == dhcpmsg.DHCP_OFFER and server > 0 and dhcpmsg.yiaddr(var msg) != 0
+            c.offered = dhcpmsg.yiaddr(var msg)
+            c.server = server
+            c.state = DHCP_STATE_REQUESTING
+            c.attempts = 1
+            c.next_at = now + retry_delay(1, c.xid)
+            if build_select_request(var c, now, var out)
+                return DHCP_ACT_BROADCAST
+    elif c.state >= DHCP_STATE_REQUESTING and c.state != DHCP_STATE_BOUND
+        if kind == dhcpmsg.DHCP_ACK
+            if accept_ack(var c, now, var msg)
+                return DHCP_ACT_BOUND
+        elif kind == dhcpmsg.DHCP_NAK
+            let server = dhcpmsg.option_u32(var msg, dhcpmsg.DHCP_OPT_SERVER_ID)
+            if server < 0 or server == c.server
+                reset(var c, now)
+                return DHCP_ACT_NAK
+    DHCP_ACT_NONE
+
+// ── Giving the address up ───────────────────────────────────────────
+
+// Tell the server the address is in use by another host, which the
+// client found by probing it (RFC 2131 section 3.1 item 5).  Builds a
+// DHCPDECLINE in `out` and answers `DHCP_ACT_BROADCAST`; the client
+// goes to INIT and waits `DHCP_DECLINE_WAIT` seconds before it starts
+// again.
+pub @tier(embedded)
+@no_alloc
+fn client_decline(var c: DhcpClient, now: Int, var out: Vec[u8; 576]) -> Int
+    var id: Vec[u8; 32] = Vec.new()
+    let _t = id.push(c.hardware_type as u8)
+    for i in 0..c.mac.len()
+        let _b = id.push(c.mac[i])
+    let built = dhcpmsg.begin(var out,
+        dhcpmsg.DHCP_BOOTREQUEST,
+        c.hardware_type,
+        var c.mac,
+        c.xid,
+        elapsed(var c, now),
+        0,
+        0,
+        0,
+        0)
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_DECLINE)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_REQUESTED_IP, c.ip)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID, c.server)
+        and dhcpmsg.put_option_bytes(var out, dhcpmsg.DHCP_OPT_CLIENT_ID, var id)
+        and dhcpmsg.finish(var out)
+    reset(var c, now + DHCP_DECLINE_WAIT)
+    var act = DHCP_ACT_NONE
+    if built
+        act = DHCP_ACT_BROADCAST
+    act
+
+// Give the lease back (RFC 2131 section 4.4.6).  Builds a DHCPRELEASE in
+// `out` and answers `DHCP_ACT_UNICAST`; the client goes to INIT.  A
+// client with no lease builds nothing and answers `DHCP_ACT_NONE`.
+pub @tier(embedded)
+@no_alloc
+fn client_release(var c: DhcpClient, now: Int, var out: Vec[u8; 576]) -> Int
+    if c.state < DHCP_STATE_BOUND
+        return DHCP_ACT_NONE
+    var id: Vec[u8; 32] = Vec.new()
+    let _t = id.push(c.hardware_type as u8)
+    for i in 0..c.mac.len()
+        let _b = id.push(c.mac[i])
+    let built = dhcpmsg.begin(var out, dhcpmsg.DHCP_BOOTREQUEST, c.hardware_type, var c.mac, c.xid, 0, 0, c.ip, 0, 0)
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_RELEASE)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID, c.server)
+        and dhcpmsg.put_option_bytes(var out, dhcpmsg.DHCP_OPT_CLIENT_ID, var id)
+        and dhcpmsg.finish(var out)
+    reset(var c, now)
+    var act = DHCP_ACT_NONE
+    if built
+        act = DHCP_ACT_UNICAST
+    act

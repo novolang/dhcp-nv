@@ -1,0 +1,118 @@
+// tests/embedded_probe.nv — the device claim, as firmware that builds
+// for a Cortex-M, boots under QEMU, and checks its answers.
+//
+// `scripts/shard_audit.sh`'s `core-embedded` row copies this file and the
+// modules it names into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a Cortex-M4 image or fails.  The same image boots with
+//
+//   qemu-system-arm -machine mps2-an386 -nographic -semihosting -kernel probe.elf
+//
+// and writes `PASS: dhcp-embedded` when every check holds.
+//
+// THE CONSUMER IS A DEVICE ON A NETWORK THAT GIVES ADDRESSES BY DHCP.
+// It has a network interface that sends and receives UDP datagrams and
+// no heap.  This program is the loop such a device runs, with the
+// network replaced by a server in the same image: the client asks, the
+// server offers, the client requests, the server acknowledges, and the
+// client holds a lease.  Then the clock passes T1 and the client renews.
+// No datagram is a list or a string; every one is a 576-byte buffer on
+// the stack, and the build proves it with `@no_alloc`.
+
+use dhcpmsg
+use dhcpclient
+use dhcpserver
+
+// The exchange, counted: one point for each thing a device depends on.
+@tier(embedded)
+@no_alloc
+fn score() -> Int
+    var n = 0
+
+    // The server owns 192.168.4.100 to 192.168.4.109 and leases for an
+    // hour.
+    var srv = dhcpserver.server_new(dhcpmsg.ip(192, 168, 4, 1), dhcpmsg.ip(255, 255, 255, 0),
+                                    dhcpmsg.ip(192, 168, 4, 1), dhcpmsg.ip(192, 168, 4, 53),
+                                    3600, dhcpmsg.ip(192, 168, 4, 100), 10)
+
+    // The device's hardware address.
+    var mac: Vec[u8; 16] = Vec.new()
+    for i in 0..6
+        let _p = mac.push((0x02 + i) as u8)
+    var dev = dhcpclient.client_new(var mac, 1, true)
+
+    var wire: Vec[u8; 576] = Vec.new()
+    var reply: Vec[u8; 576] = Vec.new()
+
+    // Time 0: the first tick sends a DHCPDISCOVER to the broadcast
+    // address.
+    var act = dhcpclient.client_tick(var dev, 0, 0x1234ABCD, var wire)
+    if act == dhcpclient.DHCP_ACT_BROADCAST and dhcpmsg.message_type(var wire) == dhcpmsg.DHCP_DISCOVER
+        n = n + 1
+    if dhcpmsg.validate(var wire) == dhcpmsg.DHCP_FAULT_NONE and wire.len() == 300
+        n = n + 1
+
+    // The server offers.
+    let offer = dhcpserver.server_handle(var srv, var wire, var reply, 0)
+    if offer.action == dhcpserver.DHCP_SEND_REPLY and dhcpmsg.message_type(var reply) == dhcpmsg.DHCP_OFFER
+        n = n + 1
+    // The device asked for a broadcast answer, so the answer is one.
+    if offer.dest == dhcpmsg.DHCP_BROADCAST and offer.port == 68
+        n = n + 1
+
+    // The device requests the offered address.
+    act = dhcpclient.client_receive(var dev, 1, var reply, var wire)
+    if act == dhcpclient.DHCP_ACT_BROADCAST and dhcpmsg.message_type(var wire) == dhcpmsg.DHCP_REQUEST
+        n = n + 1
+
+    // The server acknowledges, and the device is bound.
+    let ack = dhcpserver.server_handle(var srv, var wire, var reply, 1)
+    if ack.action == dhcpserver.DHCP_SEND_REPLY and dhcpmsg.message_type(var reply) == dhcpmsg.DHCP_ACK
+        n = n + 1
+    act = dhcpclient.client_receive(var dev, 1, var reply, var wire)
+    if act == dhcpclient.DHCP_ACT_BOUND and dhcpclient.client_state(var dev) == dhcpclient.DHCP_STATE_BOUND
+        n = n + 1
+
+    // What the lease says.
+    if dhcpclient.client_ip(var dev) == dhcpmsg.ip(192, 168, 4, 100) and dev.router == dhcpmsg.ip(192, 168, 4, 1)
+        n = n + 1
+    if dev.dns1 == dhcpmsg.ip(192, 168, 4, 53) and dev.mask == dhcpmsg.ip(255, 255, 255, 0)
+        n = n + 1
+    if dhcpclient.client_t1_at(var dev) == 1801 and dhcpclient.client_t2_at(var dev) == 3151
+        n = n + 1
+    if dhcpclient.client_remaining(var dev, 101) == 3500
+        n = n + 1
+
+    // T1 passes: the device renews with a unicast request to its server.
+    act = dhcpclient.client_tick(var dev, 1801, 0x5555, var wire)
+    if act == dhcpclient.DHCP_ACT_UNICAST and dhcpclient.client_state(var dev) == dhcpclient.DHCP_STATE_RENEWING
+        n = n + 1
+    if dhcpmsg.ciaddr(var wire) == dhcpmsg.ip(192, 168, 4, 100)
+        n = n + 1
+    let renewed = dhcpserver.server_handle(var srv, var wire, var reply, 1801)
+    if renewed.action == dhcpserver.DHCP_SEND_REPLY and renewed.dest == dhcpmsg.ip(192, 168, 4, 100)
+        n = n + 1
+    act = dhcpclient.client_receive(var dev, 1801, var reply, var wire)
+    if act == dhcpclient.DHCP_ACT_BOUND and dhcpclient.client_expires_at(var dev) == 5401
+        n = n + 1
+
+    // The device lets the address go.
+    act = dhcpclient.client_release(var dev, 1900, var wire)
+    if act == dhcpclient.DHCP_ACT_UNICAST and dhcpmsg.message_type(var wire) == dhcpmsg.DHCP_RELEASE
+        n = n + 1
+    let gone = dhcpserver.server_handle(var srv, var wire, var reply, 1900)
+    if gone.action == dhcpserver.DHCP_SEND_NONE and dhcpserver.server_free_count(var srv, 1900) == 10
+        n = n + 1
+    n
+
+@tier(embedded)
+fn main() [hw, time]
+    bsp.board.init()
+    if score() == 17
+        hal.uart.write("PASS: dhcp-embedded\n")
+    else
+        hal.uart.write("FAIL: dhcp-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

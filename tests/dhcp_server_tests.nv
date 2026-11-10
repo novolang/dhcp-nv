@@ -1,0 +1,398 @@
+// dhcp_server_tests.nv — the answer builder of a server with a small
+// pool, asked the questions RFC 2131 section 4.3 lists.
+//
+// The pool is 10.0.0.100 through 10.0.0.103, the server is 10.0.0.254,
+// and a lease is an hour.
+
+use std.test
+use dhcpmsg
+use dhcpserver
+
+fn server_ip() -> Int
+    dhcpmsg.ip(10, 0, 0, 254)
+
+fn pool(n: Int) -> Int
+    dhcpmsg.ip(10, 0, 0, 100 + n)
+
+fn a_server() -> DhcpServer
+    dhcpserver.server_new(server_ip(),
+        dhcpmsg.ip(255, 255, 255, 0),
+        dhcpmsg.ip(10, 0, 0, 1),
+        dhcpmsg.ip(10, 0, 0, 2),
+        3600,
+        pool(0),
+        4)
+
+// A request from client number `n` (hardware address 02:00:00:00:00:n).
+// A parameter that is 0 leaves its field or option out; `with_id` adds
+// the client identifier option, which is what the hardware address
+// otherwise stands in for.
+fn request(kind: Int, n: Int, flag_bits: Int, ciaddr: Int, giaddr: Int, requested: Int,
+           server: Int) -> Vec[u8; 576]
+    var mac: Vec[u8; 16] = Vec.new()
+    for b in [2, 0, 0, 0, 0, n]
+        let _p = mac.push(b as u8)
+    var m: Vec[u8; 576] = Vec.new()
+    let _b = dhcpmsg.begin(var m, dhcpmsg.DHCP_BOOTREQUEST, 1, var mac, 0xAA000000 + n, 0, flag_bits, ciaddr, 0, giaddr)
+    let _t = dhcpmsg.put_option_u8(var m, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, kind)
+    if requested != 0
+        let _r = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_REQUESTED_IP, requested)
+    if server != 0
+        let _s = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_SERVER_ID, server)
+    let _f = dhcpmsg.finish(var m)
+    m
+
+fn discover(n: Int) -> Vec[u8; 576]
+    request(dhcpmsg.DHCP_DISCOVER, n, dhcpmsg.DHCP_FLAG_BROADCAST, 0, 0, 0, 0)
+
+// A request that answers an offer of `addr`.
+fn select(n: Int, addr: Int) -> Vec[u8; 576]
+    request(dhcpmsg.DHCP_REQUEST, n, dhcpmsg.DHCP_FLAG_BROADCAST, 0, 0, addr, server_ip())
+
+fn out() -> Vec[u8; 576]
+    var o: Vec[u8; 576] = Vec.new()
+    o
+
+// Offer to client `n`, and take it.
+fn bind_client(var s: DhcpServer, n: Int, now: Int) -> Int
+    var o = out()
+    var d = discover(n)
+    let a = dhcpserver.server_handle(var s, var d, var o, now)
+    let offered = dhcpmsg.yiaddr(var o)
+    var r = select(n, offered)
+    let b = dhcpserver.server_handle(var s, var r, var o, now)
+    if a.action == dhcpserver.DHCP_SEND_REPLY and b.action == dhcpserver.DHCP_SEND_REPLY and dhcpmsg.message_type(var o) == dhcpmsg.DHCP_ACK
+        offered
+    else
+        0
+
+@test
+fn test_a_discover_is_offered_the_first_address() [io]
+    var s = a_server()
+    var o = out()
+    var d = discover(7)
+    let a = dhcpserver.server_handle(var s, var d, var o, 1000)
+    test.assert_eq(a.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.validate(var o), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert_eq(o.len(), 300)
+
+    test.case("the offer carries the address, the server and the lease")
+    test.assert_eq(dhcpmsg.op(var o), dhcpmsg.DHCP_BOOTREPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_OFFER)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(0))
+    test.assert_eq(dhcpmsg.xid(var o), 0xAA000007)
+    test.assert_eq(dhcpmsg.flags(var o), dhcpmsg.DHCP_FLAG_BROADCAST)
+    test.assert_eq(dhcpmsg.chaddr_byte(var o, 5), 7)
+    test.assert_eq(dhcpmsg.hlen(var o), 6)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_SERVER_ID), server_ip())
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_LEASE_TIME), 3600)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_RENEWAL), 1800)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_REBINDING), 3150)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_SUBNET_MASK), dhcpmsg.ip(255, 255, 255, 0))
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_ROUTER), dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_DNS), dhcpmsg.ip(10, 0, 0, 2))
+
+    test.case("the client asked for a broadcast answer, so it gets one")
+    test.assert_eq(a.dest, dhcpmsg.DHCP_BROADCAST)
+    test.assert_eq(a.port, 68)
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(0)), dhcpserver.DHCP_SLOT_OFFERED)
+
+    test.case("a client that did not ask is answered at the address it is offered")
+    var quiet = request(dhcpmsg.DHCP_DISCOVER, 8, 0, 0, 0, 0, 0)
+    let b = dhcpserver.server_handle(var s, var quiet, var o, 1000)
+    test.assert_eq(b.dest, pool(1))
+    test.assert_eq(b.port, 68)
+
+    test.case("a request that came through a relay is answered to the relay")
+    var relayed = request(dhcpmsg.DHCP_DISCOVER, 9, 0, 0, dhcpmsg.ip(10, 9, 9, 1), 0, 0)
+    let c = dhcpserver.server_handle(var s, var relayed, var o, 1000)
+    test.assert_eq(c.dest, dhcpmsg.ip(10, 9, 9, 1))
+    test.assert_eq(c.port, 67)
+    test.assert_eq(dhcpmsg.giaddr(var o), dhcpmsg.ip(10, 9, 9, 1))
+
+@test
+fn test_the_address_a_client_asks_for_is_offered_if_it_is_free() [io]
+    var s = a_server()
+    var o = out()
+    test.case("in the pool and free")
+    var want = request(dhcpmsg.DHCP_DISCOVER, 1, 0, 0, 0, pool(2), 0)
+    let _a = dhcpserver.server_handle(var s, var want, var o, 0)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(2))
+
+    test.case("in the pool and held by another client: the first free one")
+    var other = request(dhcpmsg.DHCP_DISCOVER, 2, 0, 0, 0, pool(2), 0)
+    let _b = dhcpserver.server_handle(var s, var other, var o, 0)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(0))
+
+    test.case("outside the pool: the first free one")
+    var outside = request(dhcpmsg.DHCP_DISCOVER, 3, 0, 0, 0, dhcpmsg.ip(192, 168, 0, 5), 0)
+    let _c = dhcpserver.server_handle(var s, var outside, var o, 0)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(1))
+
+    test.case("the same client is offered the same address again")
+    var again = request(dhcpmsg.DHCP_DISCOVER, 1, 0, 0, 0, 0, 0)
+    let _d = dhcpserver.server_handle(var s, var again, var o, 5)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(2))
+
+@test
+fn test_a_full_pool_offers_nothing() [io]
+    var s = a_server()
+    var o = out()
+    for n in 1..5
+        test.assert(bind_client(var s, n, 0) != 0)
+    test.assert_eq(dhcpserver.server_free_count(var s, 0), 0)
+    var late = discover(5)
+    let a = dhcpserver.server_handle(var s, var late, var o, 0)
+    test.assert_eq(a.action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("an address comes free when a lease ends")
+    test.assert_eq(dhcpserver.server_free_count(var s, 3600), 4)
+    let b = dhcpserver.server_handle(var s, var late, var o, 3600)
+    test.assert_eq(b.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(0))
+
+@test
+fn test_an_offer_is_held_for_a_minute() [io]
+    var s = a_server()
+    var o = out()
+    var d = discover(1)
+    let _a = dhcpserver.server_handle(var s, var d, var o, 100)
+    test.assert_eq(dhcpserver.server_free_count(var s, 100), 3)
+    test.assert_eq(dhcpserver.server_free_count(var s, 159), 3)
+    test.assert_eq(dhcpserver.server_free_count(var s, 160), 4)
+
+    test.case("a request after the offer lapsed is still honoured when it names this server")
+    var late = select(1, pool(0))
+    let b = dhcpserver.server_handle(var s, var late, var o, 500)
+    test.assert_eq(b.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_ACK)
+
+@test
+fn test_a_request_for_an_offer_is_acknowledged() [io]
+    var s = a_server()
+    var o = out()
+    var d = discover(1)
+    let _a = dhcpserver.server_handle(var s, var d, var o, 0)
+    var r = select(1, pool(0))
+    let b = dhcpserver.server_handle(var s, var r, var o, 10)
+    test.assert_eq(b.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_ACK)
+    test.assert_eq(dhcpmsg.yiaddr(var o), pool(0))
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_LEASE_TIME), 3600)
+    test.assert_eq(b.dest, dhcpmsg.DHCP_BROADCAST)
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(0)), dhcpserver.DHCP_SLOT_BOUND)
+
+    test.case("the lease lasts an hour from the acknowledgement")
+    test.assert_eq(dhcpserver.server_free_count(var s, 3609), 3)
+    test.assert_eq(dhcpserver.server_free_count(var s, 3610), 4)
+
+@test
+fn test_a_request_naming_another_server_gives_the_offer_up() [io]
+    var s = a_server()
+    var o = out()
+    var d = discover(1)
+    let _a = dhcpserver.server_handle(var s, var d, var o, 0)
+    var r = request(dhcpmsg.DHCP_REQUEST, 1, 0, 0, 0, pool(0), dhcpmsg.ip(10, 0, 0, 253))
+    let b = dhcpserver.server_handle(var s, var r, var o, 1)
+    test.assert_eq(b.action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(0)), dhcpserver.DHCP_SLOT_FREE)
+
+    test.case("a client with no offer from this server is just ignored")
+    var stranger = request(dhcpmsg.DHCP_REQUEST, 9, 0, 0, 0, pool(1), dhcpmsg.ip(10, 0, 0, 253))
+    test.assert_eq(dhcpserver.server_handle(var s, var stranger, var o, 1).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("a client with a lease from this server keeps it")
+    let got = bind_client(var s, 2, 2)
+    var r2 = request(dhcpmsg.DHCP_REQUEST, 2, 0, 0, 0, got, dhcpmsg.ip(10, 0, 0, 253))
+    test.assert_eq(dhcpserver.server_handle(var s, var r2, var o, 3).action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, got), dhcpserver.DHCP_SLOT_BOUND)
+
+@test
+fn test_a_request_for_an_address_it_cannot_have_is_refused() [io]
+    var s = a_server()
+    var o = out()
+    let mine = bind_client(var s, 1, 0)
+
+    test.case("outside the pool, the NAK goes to the broadcast address")
+    var off = request(dhcpmsg.DHCP_REQUEST, 2, 0, 0, 0, dhcpmsg.ip(192, 168, 5, 5), 0)
+    let a = dhcpserver.server_handle(var s, var off, var o, 1)
+    test.assert_eq(a.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_NAK)
+    test.assert_eq(dhcpmsg.yiaddr(var o), 0)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_SERVER_ID), server_ip())
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_LEASE_TIME), -1)
+    test.assert_eq(a.dest, dhcpmsg.DHCP_BROADCAST)
+    test.assert_eq(a.port, 68)
+
+    test.case("through a relay the NAK goes to the relay")
+    var via = request(dhcpmsg.DHCP_REQUEST, 2, 0, 0, dhcpmsg.ip(10, 9, 9, 1), dhcpmsg.ip(192, 168, 5, 5), 0)
+    let b = dhcpserver.server_handle(var s, var via, var o, 1)
+    test.assert_eq(b.dest, dhcpmsg.ip(10, 9, 9, 1))
+    test.assert_eq(b.port, 67)
+
+    test.case("held by another client")
+    var taken = request(dhcpmsg.DHCP_REQUEST, 3, 0, 0, 0, mine, 0)
+    let c = dhcpserver.server_handle(var s, var taken, var o, 1)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_NAK)
+    test.assert_eq(c.action, dhcpserver.DHCP_SEND_REPLY)
+
+    test.case("an address nobody holds, asked for by a client the server has not met, is not answered")
+    var unknown = request(dhcpmsg.DHCP_REQUEST, 4, 0, 0, 0, pool(3), 0)
+    test.assert_eq(dhcpserver.server_handle(var s, var unknown, var o, 1).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("a request that asks for nothing is not answered")
+    var nothing = request(dhcpmsg.DHCP_REQUEST, 4, 0, 0, 0, 0, 0)
+    test.assert_eq(dhcpserver.server_handle(var s, var nothing, var o, 1).action, dhcpserver.DHCP_SEND_NONE)
+
+@test
+fn test_a_renewal_is_acknowledged_to_the_clients_own_address() [io]
+    var s = a_server()
+    var o = out()
+    let mine = bind_client(var s, 1, 0)
+    var renew = request(dhcpmsg.DHCP_REQUEST, 1, 0, mine, 0, 0, 0)
+    let a = dhcpserver.server_handle(var s, var renew, var o, 1800)
+    test.assert_eq(a.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_ACK)
+    test.assert_eq(dhcpmsg.yiaddr(var o), mine)
+    test.assert_eq(a.dest, mine)
+    test.assert_eq(a.port, 68)
+
+    test.case("the lease runs from the renewal")
+    test.assert_eq(dhcpserver.server_free_count(var s, 5399), 3)
+    test.assert_eq(dhcpserver.server_free_count(var s, 5400), 4)
+
+@test
+fn test_a_released_address_is_free_again() [io]
+    var s = a_server()
+    var o = out()
+    let mine = bind_client(var s, 1, 0)
+
+    test.case("a release by another client changes nothing")
+    var wrong = request(dhcpmsg.DHCP_RELEASE, 2, 0, mine, 0, 0, server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var wrong, var o, 5).action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, mine), dhcpserver.DHCP_SLOT_BOUND)
+
+    test.case("an address outside the pool changes nothing")
+    var outside = request(dhcpmsg.DHCP_RELEASE, 1, 0, dhcpmsg.ip(1, 2, 3, 4), 0, 0, server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var outside, var o, 5).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("the owner's release frees the slot, and nothing is sent")
+    var right = request(dhcpmsg.DHCP_RELEASE, 1, 0, mine, 0, 0, server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var right, var o, 5).action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, mine), dhcpserver.DHCP_SLOT_FREE)
+
+@test
+fn test_a_declined_address_is_kept_out_for_an_hour() [io]
+    var s = a_server()
+    var o = out()
+    let mine = bind_client(var s, 1, 0)
+
+    test.case("a decline by another client changes nothing, and neither does one outside the pool")
+    var wrong = request(dhcpmsg.DHCP_DECLINE, 2, 0, 0, 0, mine, server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var wrong, var o, 5).action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, mine), dhcpserver.DHCP_SLOT_BOUND)
+    var outside = request(dhcpmsg.DHCP_DECLINE, 1, 0, 0, 0, dhcpmsg.ip(1, 2, 3, 4), server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var outside, var o, 5).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("the owner's decline marks the address")
+    var right = request(dhcpmsg.DHCP_DECLINE, 1, 0, 0, 0, mine, server_ip())
+    test.assert_eq(dhcpserver.server_handle(var s, var right, var o, 10).action, dhcpserver.DHCP_SEND_NONE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, mine), dhcpserver.DHCP_SLOT_DECLINED)
+
+    test.case("it is not offered, and a request for it is refused")
+    var again = discover(1)
+    let _a = dhcpserver.server_handle(var s, var again, var o, 20)
+    test.assert(dhcpmsg.yiaddr(var o) != mine)
+    var ask = select(1, mine)
+    let _b = dhcpserver.server_handle(var s, var ask, var o, 21)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_NAK)
+
+    test.case("an hour later it is back in the pool")
+    test.assert_eq(dhcpserver.server_free_count(var s, 3610), 4)
+
+@test
+fn test_an_inform_gets_the_configuration_and_no_lease() [io]
+    var s = a_server()
+    var o = out()
+    var inform = request(dhcpmsg.DHCP_INFORM, 1, 0, dhcpmsg.ip(10, 0, 0, 50), 0, 0, 0)
+    let a = dhcpserver.server_handle(var s, var inform, var o, 0)
+    test.assert_eq(a.action, dhcpserver.DHCP_SEND_REPLY)
+    test.assert_eq(dhcpmsg.message_type(var o), dhcpmsg.DHCP_ACK)
+    test.assert_eq(dhcpmsg.yiaddr(var o), 0)
+    test.assert_eq(a.dest, dhcpmsg.ip(10, 0, 0, 50))
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_LEASE_TIME), -1)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_ROUTER), dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(dhcpserver.server_free_count(var s, 0), 4)
+
+    test.case("an INFORM that names no address and came through no relay is not answered")
+    var empty = request(dhcpmsg.DHCP_INFORM, 1, 0, 0, 0, 0, 0)
+    test.assert_eq(dhcpserver.server_handle(var s, var empty, var o, 0).action, dhcpserver.DHCP_SEND_NONE)
+
+@test
+fn test_what_is_not_a_request_is_not_answered() [io]
+    var s = a_server()
+    var o = out()
+    var junk: Vec[u8; 576] = Vec.new()
+    test.assert_eq(dhcpserver.server_handle(var s, var junk, var o, 0).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("a reply from another server")
+    var echo = discover(1)
+    echo[0] = 2 as u8
+    test.assert_eq(dhcpserver.server_handle(var s, var echo, var o, 0).action, dhcpserver.DHCP_SEND_NONE)
+
+    test.case("a message type a server does not take")
+    var offer = request(dhcpmsg.DHCP_OFFER, 1, 0, 0, 0, 0, 0)
+    test.assert_eq(dhcpserver.server_handle(var s, var offer, var o, 0).action, dhcpserver.DHCP_SEND_NONE)
+
+@test
+fn test_a_client_is_known_by_its_identifier_or_its_hardware_address() [io]
+    var s = a_server()
+    var o = out()
+    test.case("one hardware address under two client identifiers is two clients")
+    let a = id_request(2, 0xA1)
+    let b = id_request(2, 0xB2)
+    var ra = a
+    var rb = b
+    let _x = dhcpserver.server_handle(var s, var ra, var o, 0)
+    let first = dhcpmsg.yiaddr(var o)
+    let _y = dhcpserver.server_handle(var s, var rb, var o, 0)
+    test.assert(dhcpmsg.yiaddr(var o) != first)
+
+    test.case("one client identifier under two hardware addresses is one client")
+    var rc = id_request(3, 0xA1)
+    let _z = dhcpserver.server_handle(var s, var rc, var o, 1)
+    test.assert_eq(dhcpmsg.yiaddr(var o), first)
+
+// A DISCOVER from client `n` that carries the client identifier
+// option with one byte of identifier.
+fn id_request(n: Int, ident: Int) -> Vec[u8; 576]
+    var mac: Vec[u8; 16] = Vec.new()
+    for b in [2, 0, 0, 0, 0, n]
+        let _p = mac.push(b as u8)
+    var m: Vec[u8; 576] = Vec.new()
+    let _b = dhcpmsg.begin(var m, dhcpmsg.DHCP_BOOTREQUEST, 1, var mac, 1, 0, 0, 0, 0, 0)
+    let _t = dhcpmsg.put_option_u8(var m, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, dhcpmsg.DHCP_DISCOVER)
+    let _i = dhcpmsg.put_option_u8(var m, dhcpmsg.DHCP_OPT_CLIENT_ID, ident)
+    let _f = dhcpmsg.finish(var m)
+    m
+
+@test
+fn test_the_pool_is_between_one_and_sixteen_addresses() [io]
+    let none = dhcpserver.server_new(server_ip(), 0, 0, 0, 60, pool(0), 0)
+    test.assert_eq(none.pool_count, 1)
+    let huge = dhcpserver.server_new(server_ip(), 0, 0, 0, 60, pool(0), 99)
+    test.assert_eq(huge.pool_count, dhcpserver.DHCP_POOL_MAX)
+    var s = a_server()
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(0)), dhcpserver.DHCP_SLOT_FREE)
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(4)), -1)
+    test.assert_eq(dhcpserver.server_slot_state(var s, pool(0) - 1), -1)
+
+    test.case("a server with no router, no DNS server and no mask leaves the options out")
+    var bare = dhcpserver.server_new(server_ip(), 0, 0, 0, 60, pool(0), 2)
+    var o = out()
+    var d = discover(1)
+    let _a = dhcpserver.server_handle(var bare, var d, var o, 0)
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_SUBNET_MASK), -1)
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_ROUTER), -1)
+    test.assert_eq(dhcpmsg.option_len(var o, dhcpmsg.DHCP_OPT_DNS), -1)
+    test.assert_eq(dhcpmsg.option_u32(var o, dhcpmsg.DHCP_OPT_LEASE_TIME), 60)

@@ -1,0 +1,356 @@
+// dhcpserver.nv — the answer builder of a DHCP server for a small static
+// pool (RFC 2131 section 4.3).
+//
+// The pool is a run of consecutive addresses, at most 16, handed out for
+// a lease time the same for every client.  A server is a `@value` struct
+// of a few integers and a table of sixteen slots.  A request arrives as
+// a `Vec[u8; 576]`, the reply is built in another, and the answer says
+// where to send it.  The clock is a number the caller passes.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`, so the same
+// code is a lease server on a gateway board and a fixture in a test.
+//
+// What the server does: it offers an address to a DHCPDISCOVER, answers
+// a DHCPREQUEST with an ACK or a NAK, answers a DHCPINFORM with the
+// configuration and no lease, and frees an address on DHCPRELEASE and
+// DHCPDECLINE.  A client is known by its client identifier option, or by
+// its hardware type and address when it sends none.
+//
+// What it does not do: it ignores the parameter request list and always
+// sends the mask, the router and one DNS server; it keeps no lease
+// across a restart; it does not check that an offered address is
+// unused, which needs an ARP probe the caller can make.
+
+use dhcpmsg
+
+// The most addresses a pool holds.
+pub const DHCP_POOL_MAX = 16
+
+// A slot with no client.
+pub const DHCP_SLOT_FREE = 0
+// An address offered and held for a short time for the client that
+// asked.
+pub const DHCP_SLOT_OFFERED = 1
+// An address leased to a client.
+pub const DHCP_SLOT_BOUND = 2
+// An address a client reported in use by another host.
+pub const DHCP_SLOT_DECLINED = 3
+
+// How long an offer is held, in seconds.
+pub const DHCP_OFFER_HOLD = 60
+
+// How long a declined address is kept out of the pool, in seconds.
+pub const DHCP_DECLINE_HOLD = 3600
+
+// What the server does with a message.  Nothing: the message is not for
+// this server or is not valid.
+pub const DHCP_SEND_NONE = 0
+// Write the reply in `out` to `dest`, port `port`.
+pub const DHCP_SEND_REPLY = 1
+
+// One address of the pool.
+pub @value
+struct DhcpSlot
+    // A hash of the client identifier, valid while the slot is not free.
+    owner: Int
+    state: Int
+    // When an offer lapses or a lease ends, in the caller's seconds.
+    expires: Int
+
+// A server and its pool.
+pub @value
+struct DhcpServer
+    // The address the server announces as its identifier.
+    server_id: Int
+    mask: Int
+    router: Int
+    dns: Int
+    lease_secs: Int
+    // The first address of the pool, and how many there are.
+    pool_start: Int
+    pool_count: Int
+    slots: Vec[DhcpSlot; 16]
+
+// What the server decided to do with one message, and where the reply
+// goes.
+pub @value
+struct DhcpAnswer
+    action: Int
+    // The destination address and UDP port of the reply.
+    dest: Int
+    port: Int
+
+// A server for the pool `pool_start` through `pool_start + pool_count -
+// 1`, which is reduced to between 1 and 16 addresses.  `server_id` is
+// the server's own address; `router` and `dns` are given to clients and
+// 0 leaves the option out.  Leases last `lease_secs` seconds.
+pub @tier(embedded)
+@no_alloc
+fn server_new(server_id: Int, mask: Int, router: Int, dns: Int, lease_secs: Int, pool_start: Int,
+              pool_count: Int) -> DhcpServer
+    var count = pool_count
+    if count < 1
+        count = 1
+    if count > DHCP_POOL_MAX
+        count = DHCP_POOL_MAX
+    var s = DhcpServer { server_id: server_id, mask: mask, router: router, dns: dns,
+                         lease_secs: lease_secs, pool_start: pool_start, pool_count: count,
+                         slots: Vec.new() }
+    for _ in 0..count
+        let _p = s.slots.push(DhcpSlot { owner: 0, state: DHCP_SLOT_FREE, expires: 0 })
+    s
+
+// The state of the slot for address `addr`, or -1 when the address is
+// not in the pool.
+pub @tier(embedded)
+@no_alloc
+fn server_slot_state(var s: DhcpServer, addr: Int) -> Int
+    let i = addr - s.pool_start
+    if i < 0 or i >= s.pool_count
+        -1
+    else
+        s.slots[i].state
+
+// How many addresses of the pool are free at `now`.
+pub @tier(embedded)
+@no_alloc
+fn server_free_count(var s: DhcpServer, now: Int) -> Int
+    var n = 0
+    for i in 0..s.pool_count
+        if s.slots[i].state == DHCP_SLOT_FREE or s.slots[i].expires <= now
+            n = n + 1
+    n
+
+// ── Who a client is ─────────────────────────────────────────────────
+
+// A hash of the client's identity: the client identifier option when
+// there is one, otherwise the hardware type and address.  The hash is
+// 64-bit FNV-1a in shape (xor, then multiply by the FNV prime).
+@tier(embedded)
+@no_alloc
+fn owner_of(var msg: Vec[u8; 576]) -> Int
+    var h = 1469598103934665603
+    let id_len = dhcpmsg.option_len(var msg, dhcpmsg.DHCP_OPT_CLIENT_ID)
+    if id_len > 0
+        for i in 0..id_len
+            h = int.wrapping_mul(h ^ dhcpmsg.option_byte(var msg, dhcpmsg.DHCP_OPT_CLIENT_ID, i), 1099511628211)
+    else
+        h = int.wrapping_mul(h ^ dhcpmsg.htype(var msg), 1099511628211)
+        for i in 0..dhcpmsg.hlen(var msg)
+            h = int.wrapping_mul(h ^ dhcpmsg.chaddr_byte(var msg, i), 1099511628211)
+    h
+
+// Free every slot whose offer or lease has run out.
+@tier(embedded)
+@no_alloc
+fn expire(var s: DhcpServer, now: Int)
+    for i in 0..s.pool_count
+        if s.slots[i].state != DHCP_SLOT_FREE and s.slots[i].expires <= now
+            s.slots[i].state = DHCP_SLOT_FREE
+
+// The slot a client already holds, or -1.
+@tier(embedded)
+@no_alloc
+fn slot_of(var s: DhcpServer, owner: Int) -> Int
+    var found = -1
+    for i in 0..s.pool_count
+        if s.slots[i].state != DHCP_SLOT_FREE and s.slots[i].state != DHCP_SLOT_DECLINED and s.slots[i].owner == owner
+            found = i
+    found
+
+// The first free slot, or -1.
+@tier(embedded)
+@no_alloc
+fn first_free(var s: DhcpServer) -> Int
+    var found = -1
+    for i in 0..s.pool_count
+        if found < 0 and s.slots[i].state == DHCP_SLOT_FREE
+            found = i
+    found
+
+// ── Building replies ────────────────────────────────────────────────
+
+// Whether the options that follow a type and server identifier are the
+// lease's, or the configuration alone (the answer to a DHCPINFORM).
+@tier(embedded)
+@no_alloc
+fn put_configuration(var s: DhcpServer, var out: Vec[u8; 576], with_lease: Bool) -> Bool
+    var ok = true
+    if with_lease
+        ok = dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_LEASE_TIME, s.lease_secs)
+            and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_RENEWAL, s.lease_secs / 2)
+            and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_REBINDING, s.lease_secs * 7 / 8)
+    if s.mask != 0
+        ok = ok and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_SUBNET_MASK, s.mask)
+    if s.router != 0
+        ok = ok and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_ROUTER, s.router)
+    if s.dns != 0
+        ok = ok and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_DNS, s.dns)
+    ok
+
+// Where a reply goes (RFC 2131 section 4.1): to the relay agent when the
+// request came through one, to the broadcast address for a DHCPNAK, to
+// the client's own address when it has one, to the broadcast address
+// when the client asked for it, and otherwise to the address being
+// assigned.
+@tier(embedded)
+@no_alloc
+fn destination(var req: Vec[u8; 576], kind: Int, assigned: Int) -> DhcpAnswer
+    if dhcpmsg.giaddr(var req) != 0
+        DhcpAnswer { action: DHCP_SEND_REPLY,
+            dest: dhcpmsg.giaddr(var req),
+            port: dhcpmsg.DHCP_SERVER_PORT }
+    elif kind == dhcpmsg.DHCP_NAK
+        DhcpAnswer { action: DHCP_SEND_REPLY,
+            dest: dhcpmsg.DHCP_BROADCAST,
+            port: dhcpmsg.DHCP_CLIENT_PORT }
+    elif dhcpmsg.ciaddr(var req) != 0
+        DhcpAnswer { action: DHCP_SEND_REPLY,
+            dest: dhcpmsg.ciaddr(var req),
+            port: dhcpmsg.DHCP_CLIENT_PORT }
+    elif (dhcpmsg.flags(var req) & dhcpmsg.DHCP_FLAG_BROADCAST) != 0
+        DhcpAnswer { action: DHCP_SEND_REPLY,
+            dest: dhcpmsg.DHCP_BROADCAST,
+            port: dhcpmsg.DHCP_CLIENT_PORT }
+    else
+        DhcpAnswer { action: DHCP_SEND_REPLY, dest: assigned, port: dhcpmsg.DHCP_CLIENT_PORT }
+
+// No reply.
+@tier(embedded)
+@no_alloc
+fn silent() -> DhcpAnswer
+    DhcpAnswer { action: DHCP_SEND_NONE, dest: 0, port: 0 }
+
+// Build the reply `kind` to `req` in `out`: an OFFER or ACK that assigns
+// `assigned`, a NAK, or the ACK to an INFORM.
+@tier(embedded)
+@no_alloc
+fn reply(var s: DhcpServer, var req: Vec[u8; 576], var out: Vec[u8; 576], kind: Int,
+         assigned: Int) -> DhcpAnswer
+    var mac: Vec[u8; 16] = Vec.new()
+    dhcpmsg.read_chaddr(var req, var mac)
+    let with_lease = kind == dhcpmsg.DHCP_OFFER or kind == dhcpmsg.DHCP_ACK and assigned != 0
+    var ok = dhcpmsg.begin(var out,
+        dhcpmsg.DHCP_BOOTREPLY,
+        dhcpmsg.htype(var req),
+        var mac,
+        dhcpmsg.xid(var req),
+        0,
+        dhcpmsg.flags(var req),
+        0,
+        assigned,
+        dhcpmsg.giaddr(var req))
+        and dhcpmsg.put_option_u8(var out, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, kind)
+        and dhcpmsg.put_option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID, s.server_id)
+    if kind != dhcpmsg.DHCP_NAK
+        ok = ok and put_configuration(var s, var out, with_lease)
+    ok = ok and dhcpmsg.finish(var out)
+    var answer = silent()
+    if ok
+        answer = destination(var req, kind, assigned)
+    answer
+
+// ── Handling requests ───────────────────────────────────────────────
+
+// A DHCPDISCOVER: offer the address the client already holds, else the
+// one it asked for if that is free, else the first free one.
+@tier(embedded)
+@no_alloc
+fn on_discover(var s: DhcpServer, var req: Vec[u8; 576], var out: Vec[u8; 576], now: Int,
+               owner: Int) -> DhcpAnswer
+    var i = slot_of(var s, owner)
+    if i < 0
+        let want = dhcpmsg.option_u32(var req, dhcpmsg.DHCP_OPT_REQUESTED_IP) - s.pool_start
+        if want >= 0 and want < s.pool_count and s.slots[want].state == DHCP_SLOT_FREE
+            i = want
+        else
+            i = first_free(var s)
+    if i < 0
+        return silent()
+    if s.slots[i].state != DHCP_SLOT_BOUND
+        s.slots[i].state = DHCP_SLOT_OFFERED
+        s.slots[i].owner = owner
+        s.slots[i].expires = now + DHCP_OFFER_HOLD
+    reply(var s, var req, var out, dhcpmsg.DHCP_OFFER, s.pool_start + i)
+
+// A DHCPREQUEST in any of its four forms (RFC 2131 section 4.3.2).
+//
+// A request that names another server is a refusal of this server's
+// offer, and the offer is released.  Otherwise the client is given the
+// address if the table agrees, refused if it asks for an address it
+// cannot have, and left unanswered if the server has no record of it.
+@tier(embedded)
+@no_alloc
+fn on_request(var s: DhcpServer, var req: Vec[u8; 576], var out: Vec[u8; 576], now: Int,
+              owner: Int) -> DhcpAnswer
+    let named = dhcpmsg.option_u32(var req, dhcpmsg.DHCP_OPT_SERVER_ID)
+    var wanted = dhcpmsg.ciaddr(var req)
+    if wanted == 0
+        wanted = dhcpmsg.option_u32(var req, dhcpmsg.DHCP_OPT_REQUESTED_IP)
+    if named >= 0 and named != s.server_id
+        let held = slot_of(var s, owner)
+        if held >= 0 and s.slots[held].state == DHCP_SLOT_OFFERED
+            s.slots[held].state = DHCP_SLOT_FREE
+        return silent()
+    if wanted <= 0
+        return silent()
+    let i = wanted - s.pool_start
+    if i < 0 or i >= s.pool_count
+        return reply(var s, var req, var out, dhcpmsg.DHCP_NAK, 0)
+    let st = s.slots[i].state
+    if st == DHCP_SLOT_DECLINED or st != DHCP_SLOT_FREE and s.slots[i].owner != owner
+        return reply(var s, var req, var out, dhcpmsg.DHCP_NAK, 0)
+    if st == DHCP_SLOT_FREE and named < 0
+        // No offer was made and the client is not choosing among
+        // servers: the server has no record of it.
+        return silent()
+    s.slots[i].state = DHCP_SLOT_BOUND
+    s.slots[i].owner = owner
+    s.slots[i].expires = now + s.lease_secs
+    reply(var s, var req, var out, dhcpmsg.DHCP_ACK, wanted)
+
+// A DHCPINFORM: the configuration for an address the client already has,
+// with no lease (RFC 2131 section 4.3.5).
+@tier(embedded)
+@no_alloc
+fn on_inform(var s: DhcpServer, var req: Vec[u8; 576], var out: Vec[u8; 576]) -> DhcpAnswer
+    if dhcpmsg.ciaddr(var req) == 0 and dhcpmsg.giaddr(var req) == 0
+        silent()
+    else
+        reply(var s, var req, var out, dhcpmsg.DHCP_ACK, 0)
+
+// Handle one message received on the server's port.
+//
+// `req` is the datagram, `out` receives the reply, and `now` is the
+// caller's clock in seconds.  The answer's action is `DHCP_SEND_REPLY`
+// when `out` holds a message to write to `dest` and `port`, and
+// `DHCP_SEND_NONE` otherwise.  A message that is invalid, that is not a
+// request, or that is addressed to another server gets no answer.
+pub @tier(embedded)
+@no_alloc
+fn server_handle(var s: DhcpServer, var req: Vec[u8; 576], var out: Vec[u8; 576],
+                 now: Int) -> DhcpAnswer
+    if dhcpmsg.validate(var req) != dhcpmsg.DHCP_FAULT_NONE or dhcpmsg.op(var req) != dhcpmsg.DHCP_BOOTREQUEST
+        return silent()
+    expire(var s, now)
+    let kind = dhcpmsg.message_type(var req)
+    let owner = owner_of(var req)
+    if kind == dhcpmsg.DHCP_DISCOVER
+        on_discover(var s, var req, var out, now, owner)
+    elif kind == dhcpmsg.DHCP_REQUEST
+        on_request(var s, var req, var out, now, owner)
+    elif kind == dhcpmsg.DHCP_INFORM
+        on_inform(var s, var req, var out)
+    elif kind == dhcpmsg.DHCP_RELEASE
+        let i = dhcpmsg.ciaddr(var req) - s.pool_start
+        if i >= 0 and i < s.pool_count and s.slots[i].owner == owner and s.slots[i].state == DHCP_SLOT_BOUND
+            s.slots[i].state = DHCP_SLOT_FREE
+        silent()
+    elif kind == dhcpmsg.DHCP_DECLINE
+        let i = dhcpmsg.option_u32(var req, dhcpmsg.DHCP_OPT_REQUESTED_IP) - s.pool_start
+        if i >= 0 and i < s.pool_count and s.slots[i].owner == owner
+            s.slots[i].state = DHCP_SLOT_DECLINED
+            s.slots[i].expires = now + DHCP_DECLINE_HOLD
+        silent()
+    else
+        silent()

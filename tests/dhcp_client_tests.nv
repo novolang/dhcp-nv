@@ -1,0 +1,457 @@
+// dhcp_client_tests.nv — the client of RFC 2131 section 4.4 driven by
+// messages written out by the test and a clock the test sets.
+//
+// The server's messages here are built with the message writers rather
+// than by `dhcpserver`, so each test says exactly what the client was
+// told.  `dhcp_exchange_tests.nv` runs the client against the server.
+
+use std.test
+use dhcpmsg
+use dhcpclient
+
+// The device's hardware address: 02:03:04:05:06:07.
+fn a_mac() -> Vec[u8; 16]
+    var mac: Vec[u8; 16] = Vec.new()
+    for i in 0..6
+        let _p = mac.push((2 + i) as u8)
+    mac
+
+fn a_client() -> DhcpClient
+    var mac = a_mac()
+    dhcpclient.client_new(var mac, 1, true)
+
+// A random word whose jitter is 0: 0xABCD is 43981, which is 1 more than
+// a multiple of three.
+fn r0() -> Int
+    0x1234ABCD
+
+// A message of three bytes of address, as a list option.
+fn put_two_ips(var m: Vec[u8; 576], code: Int, a: Int, b: Int)
+    var v: Vec[u8; 32] = Vec.new()
+    for shift in [24, 16, 8, 0]
+        let _x = v.push(((a >> shift) & 255) as u8)
+    for shift in [24, 16, 8, 0]
+        let _y = v.push(((b >> shift) & 255) as u8)
+    let _p = dhcpmsg.put_option_bytes(var m, code, var v)
+
+// A message from the server `server`.  A parameter that is 0 leaves its
+// option out.  The options are the subnet mask 255.255.255.0, the router
+// 10.0.0.1 and two DNS servers.
+fn from_server(kind: Int, txid: Int, assigned: Int, server: Int, lease: Int, t1: Int,
+               t2: Int) -> Vec[u8; 576]
+    var mac = a_mac()
+    var m: Vec[u8; 576] = Vec.new()
+    let _b = dhcpmsg.begin(var m, dhcpmsg.DHCP_BOOTREPLY, 1, var mac, txid, 0, 0, 0, assigned, 0)
+    let _t = dhcpmsg.put_option_u8(var m, dhcpmsg.DHCP_OPT_MESSAGE_TYPE, kind)
+    if server != 0
+        let _s = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_SERVER_ID, server)
+    if lease != 0
+        let _l = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_LEASE_TIME, lease)
+    if t1 != 0
+        let _1 = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_RENEWAL, t1)
+    if t2 != 0
+        let _2 = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_REBINDING, t2)
+    let _m = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_SUBNET_MASK, dhcpmsg.ip(255, 255, 255, 0))
+    let _r = dhcpmsg.put_option_u32(var m, dhcpmsg.DHCP_OPT_ROUTER, dhcpmsg.ip(10, 0, 0, 1))
+    put_two_ips(var m, dhcpmsg.DHCP_OPT_DNS, dhcpmsg.ip(10, 0, 0, 2), dhcpmsg.ip(10, 0, 0, 3))
+    let _f = dhcpmsg.finish(var m)
+    m
+
+fn server_ip() -> Int
+    dhcpmsg.ip(10, 0, 0, 254)
+
+fn lease_ip() -> Int
+    dhcpmsg.ip(10, 0, 0, 77)
+
+// Run a new client to SELECTING at time 0, then give it an offer and
+// answer REQUESTING at time 1.  The transaction identifier is 0x1234ABCD.
+fn requesting() -> DhcpClient
+    var c = a_client()
+    var out: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, r0(), var out)
+    var offer = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    let _b = dhcpclient.client_receive(var c, 1, var offer, var out)
+    c
+
+// A client holding a lease of 1000 seconds granted at time 2: T1 at 502,
+// T2 at 877, the end at 1002.
+fn bound() -> DhcpClient
+    var c = requesting()
+    var out: Vec[u8; 576] = Vec.new()
+    var ack = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    let _a = dhcpclient.client_receive(var c, 2, var ack, var out)
+    c
+
+@test
+fn test_a_new_client_discovers() [io]
+    var c = a_client()
+    var out: Vec[u8; 576] = Vec.new()
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+    test.assert(not dhcpclient.client_has_lease(var c))
+
+    let act = dhcpclient.client_tick(var c, 0, r0(), var out)
+    test.assert_eq(act, dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_SELECTING)
+
+    test.case("the DHCPDISCOVER names the transaction, the client and what it wants")
+    test.assert_eq(dhcpmsg.validate(var out), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert_eq(out.len(), 300)
+    test.assert_eq(dhcpmsg.op(var out), dhcpmsg.DHCP_BOOTREQUEST)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_DISCOVER)
+    test.assert_eq(dhcpmsg.xid(var out), 0x1234ABCD)
+    test.assert_eq(dhcpmsg.hlen(var out), 6)
+    test.assert_eq(dhcpmsg.chaddr_byte(var out, 0), 2)
+    test.assert_eq(dhcpmsg.chaddr_byte(var out, 5), 7)
+    test.assert_eq(dhcpmsg.flags(var out), dhcpmsg.DHCP_FLAG_BROADCAST)
+    test.assert_eq(dhcpmsg.ciaddr(var out), 0)
+    test.assert_eq(dhcpmsg.option_len(var out, dhcpmsg.DHCP_OPT_CLIENT_ID), 7)
+    test.assert_eq(dhcpmsg.option_byte(var out, dhcpmsg.DHCP_OPT_CLIENT_ID, 0), 1)
+    test.assert_eq(dhcpmsg.option_byte(var out, dhcpmsg.DHCP_OPT_CLIENT_ID, 6), 7)
+    test.assert_eq(dhcpmsg.option_byte(var out, dhcpmsg.DHCP_OPT_MAX_MESSAGE, 0) * 256 + dhcpmsg.option_byte(var out, dhcpmsg.DHCP_OPT_MAX_MESSAGE, 1),
+        576)
+    test.assert_eq(dhcpmsg.option_len(var out, dhcpmsg.DHCP_OPT_PARAMETER_LIST), 6)
+    test.assert_eq(dhcpmsg.option_byte(var out, dhcpmsg.DHCP_OPT_PARAMETER_LIST, 0), dhcpmsg.DHCP_OPT_SUBNET_MASK)
+
+    test.case("a client that can receive unicast does not set the broadcast flag")
+    var mac = a_mac()
+    var quiet = dhcpclient.client_new(var mac, 1, false)
+    let _q = dhcpclient.client_tick(var quiet, 0, r0(), var out)
+    test.assert_eq(dhcpmsg.flags(var out), 0)
+
+@test
+fn test_discover_is_sent_again_with_a_doubling_wait() [io]
+    var c = a_client()
+    var out: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, r0(), var out)
+    test.assert_eq(dhcpclient.client_next_at(var c), 4)
+
+    test.case("a tick before the wait is over does nothing")
+    test.assert_eq(dhcpclient.client_tick(var c, 3, r0(), var out), dhcpclient.DHCP_ACT_NONE)
+
+    test.case("the waits are 4, 8, 16, 32, 64 and then 64 seconds")
+    var at = 4
+    for wait in [8, 16, 32, 64, 64]
+        test.assert_eq(dhcpclient.client_tick(var c, at, r0(), var out), dhcpclient.DHCP_ACT_BROADCAST)
+        test.assert_eq(dhcpmsg.xid(var out), 0x1234ABCD)
+        test.assert_eq(dhcpclient.client_next_at(var c), at + wait)
+        at = at + wait
+
+    test.case("the elapsed time is in the secs field")
+    test.assert_eq(dhcpmsg.secs(var out), 124)
+
+    test.case("the jitter is one second either way")
+    var early = a_client()
+    let _e = dhcpclient.client_tick(var early, 0, 3, var out)
+    test.assert_eq(dhcpclient.client_next_at(var early), 3)
+    var late = a_client()
+    let _l = dhcpclient.client_tick(var late, 0, 2, var out)
+    test.assert_eq(dhcpclient.client_next_at(var late), 5)
+
+    test.case("secs stops at 65535")
+    var long_wait = a_client()
+    let _w = dhcpclient.client_tick(var long_wait, 0, r0(), var out)
+    let _x = dhcpclient.client_tick(var long_wait, 100000, r0(), var out)
+    test.assert_eq(dhcpmsg.secs(var out), 65535)
+
+@test
+fn test_the_first_offer_is_requested() [io]
+    var c = a_client()
+    var out: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, r0(), var out)
+
+    test.case("a message for another transaction, another client or the wrong op is ignored")
+    var stranger = from_server(dhcpmsg.DHCP_OFFER, 99, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var stranger, var out), dhcpclient.DHCP_ACT_NONE)
+    var other_mac = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    other_mac[28] = 0x99 as u8
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var other_mac, var out), dhcpclient.DHCP_ACT_NONE)
+    var short_hlen = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    short_hlen[2] = 5 as u8
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var short_hlen, var out), dhcpclient.DHCP_ACT_NONE)
+    var echo = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    echo[0] = 1 as u8
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var echo, var out), dhcpclient.DHCP_ACT_NONE)
+    var junk: Vec[u8; 576] = Vec.new()
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var junk, var out), dhcpclient.DHCP_ACT_NONE)
+
+    test.case("an offer without a server identifier or an address is ignored")
+    var no_server = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), 0, 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var no_server, var out), dhcpclient.DHCP_ACT_NONE)
+    var no_address = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, 0, server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var no_address, var out), dhcpclient.DHCP_ACT_NONE)
+
+    test.case("an ACK is not an offer")
+    var ack = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var ack, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_SELECTING)
+
+    test.case("the offer is requested from the server that made it")
+    var offer = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 1, var offer, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REQUESTING)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_REQUEST)
+    test.assert_eq(dhcpmsg.xid(var out), 0x1234ABCD)
+    test.assert_eq(dhcpmsg.ciaddr(var out), 0)
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_REQUESTED_IP), lease_ip())
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID), server_ip())
+    test.assert_eq(dhcpmsg.flags(var out), dhcpmsg.DHCP_FLAG_BROADCAST)
+    test.assert_eq(dhcpclient.client_server(var c), server_ip())
+
+    test.case("a second offer is ignored")
+    var again = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip() + 1, server_ip() - 1, 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var again, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_server(var c), server_ip())
+
+@test
+fn test_request_is_sent_again_and_then_given_up() [io]
+    var c = requesting()
+    var out: Vec[u8; 576] = Vec.new()
+    // The request went out at time 1; the first wait is 4 seconds.
+    test.assert_eq(dhcpclient.client_next_at(var c), 5)
+    test.assert_eq(dhcpclient.client_tick(var c, 4, r0(), var out), dhcpclient.DHCP_ACT_NONE)
+
+    test.case("four more transmissions, each with a longer wait")
+    var at = 5
+    for wait in [8, 16, 32, 64]
+        test.assert_eq(dhcpclient.client_tick(var c, at, r0(), var out), dhcpclient.DHCP_ACT_BROADCAST)
+        test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_REQUEST)
+        test.assert_eq(dhcpclient.client_next_at(var c), at + wait)
+        at = at + wait
+
+    test.case("after five transmissions the client starts again from INIT")
+    test.assert_eq(dhcpclient.client_tick(var c, at, r0(), var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+    test.assert_eq(dhcpclient.client_tick(var c, at, 0x77777, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpmsg.xid(var out), 0x77777)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_DISCOVER)
+
+@test
+fn test_an_ack_grants_the_lease() [io]
+    var c = requesting()
+    var out: Vec[u8; 576] = Vec.new()
+
+    test.case("an ACK with no lease time, or no address, is not a lease")
+    var no_lease = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 0, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var no_lease, var out), dhcpclient.DHCP_ACT_NONE)
+    var no_ip = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, 0, server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var no_ip, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REQUESTING)
+    test.assert_eq(dhcpclient.client_ip(var c), 0)
+
+    test.case("an ACK with a lease binds")
+    var ack = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var ack, var out), dhcpclient.DHCP_ACT_BOUND)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_BOUND)
+    test.assert(dhcpclient.client_has_lease(var c))
+    test.assert_eq(dhcpclient.client_ip(var c), lease_ip())
+    test.assert_eq(c.mask, dhcpmsg.ip(255, 255, 255, 0))
+    test.assert_eq(c.router, dhcpmsg.ip(10, 0, 0, 1))
+    test.assert_eq(c.dns1, dhcpmsg.ip(10, 0, 0, 2))
+    test.assert_eq(c.dns2, dhcpmsg.ip(10, 0, 0, 3))
+
+    test.case("with no T1 or T2 they are half and seven eighths of the lease")
+    test.assert_eq(dhcpclient.client_t1_at(var c), 502)
+    test.assert_eq(dhcpclient.client_t2_at(var c), 877)
+    test.assert_eq(dhcpclient.client_expires_at(var c), 1002)
+    test.assert_eq(dhcpclient.client_next_at(var c), 502)
+    test.assert_eq(dhcpclient.client_remaining(var c, 2), 1000)
+    test.assert_eq(dhcpclient.client_remaining(var c, 502), 500)
+    test.assert_eq(dhcpclient.client_remaining(var c, 5000), 0)
+    test.assert(not dhcpclient.client_lease_is_infinite(var c))
+
+    test.case("a message that arrives once bound is ignored")
+    test.assert_eq(dhcpclient.client_receive(var c, 3, var ack, var out), dhcpclient.DHCP_ACT_NONE)
+
+@test
+fn test_the_server_may_set_the_timers() [io]
+    var out: Vec[u8; 576] = Vec.new()
+    test.case("a T1 and a T2 that satisfy T1 < T2 < lease are used")
+    var c = requesting()
+    var good = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 100, 200)
+    let _a = dhcpclient.client_receive(var c, 2, var good, var out)
+    test.assert_eq(dhcpclient.client_t1_at(var c), 102)
+    test.assert_eq(dhcpclient.client_t2_at(var c), 202)
+
+    test.case("a T2 that is not above T1 is replaced by the defaults")
+    var d = requesting()
+    var inverted = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 300, 200)
+    let _b = dhcpclient.client_receive(var d, 2, var inverted, var out)
+    test.assert_eq(dhcpclient.client_t1_at(var d), 502)
+    test.assert_eq(dhcpclient.client_t2_at(var d), 877)
+
+    test.case("a T2 that is not below the lease is replaced by the defaults")
+    var e = requesting()
+    var past = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 1000, 300, 1000)
+    let _c = dhcpclient.client_receive(var e, 2, var past, var out)
+    test.assert_eq(dhcpclient.client_t2_at(var e), 877)
+
+    test.case("an ACK that names no server leaves the one the client chose")
+    var f = requesting()
+    var anon = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), 0, 1000, 0, 0)
+    let _d = dhcpclient.client_receive(var f, 2, var anon, var out)
+    test.assert_eq(dhcpclient.client_server(var f), server_ip())
+
+@test
+fn test_a_nak_sends_the_client_back_to_init() [io]
+    var out: Vec[u8; 576] = Vec.new()
+
+    test.case("from a server the client is not talking to it is ignored")
+    var c = requesting()
+    var forged = from_server(dhcpmsg.DHCP_NAK, 0x1234ABCD, 0, server_ip() + 1, 0, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var forged, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REQUESTING)
+
+    test.case("from the right server it ends the attempt")
+    var real = from_server(dhcpmsg.DHCP_NAK, 0x1234ABCD, 0, server_ip(), 0, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var real, var out), dhcpclient.DHCP_ACT_NAK)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+    test.assert_eq(dhcpclient.client_ip(var c), 0)
+
+    test.case("one with no server identifier is taken")
+    var d = requesting()
+    var anon = from_server(dhcpmsg.DHCP_NAK, 0x1234ABCD, 0, 0, 0, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var d, 2, var anon, var out), dhcpclient.DHCP_ACT_NAK)
+
+    test.case("and the client starts again on its next tick")
+    test.assert_eq(dhcpclient.client_tick(var d, 2, 0x4242, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_DISCOVER)
+
+    test.case("a message other than ACK or NAK in REQUESTING is ignored")
+    var e = requesting()
+    var offer = from_server(dhcpmsg.DHCP_OFFER, 0x1234ABCD, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var e, 2, var offer, var out), dhcpclient.DHCP_ACT_NONE)
+
+@test
+fn test_the_lease_is_renewed_at_t1() [io]
+    var c = bound()
+    var out: Vec[u8; 576] = Vec.new()
+
+    test.case("nothing happens before T1")
+    test.assert_eq(dhcpclient.client_tick(var c, 501, 5, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_BOUND)
+
+    test.case("at T1 the client asks its server, by unicast, to extend the lease")
+    test.assert_eq(dhcpclient.client_tick(var c, 502, 0x9999, var out), dhcpclient.DHCP_ACT_UNICAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_RENEWING)
+    test.assert(dhcpclient.client_has_lease(var c))
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_REQUEST)
+    test.assert_eq(dhcpmsg.ciaddr(var out), lease_ip())
+    test.assert_eq(dhcpmsg.xid(var out), 0x9999)
+    test.assert_eq(dhcpmsg.flags(var out), 0)
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_REQUESTED_IP), -1)
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID), -1)
+
+    test.case("the request is repeated after half the time to T2")
+    // 877 - 502 = 375, half of it 187.
+    test.assert_eq(dhcpclient.client_next_at(var c), 502 + 187)
+    test.assert_eq(dhcpclient.client_tick(var c, 600, 5, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_tick(var c, 689, 5, var out), dhcpclient.DHCP_ACT_UNICAST)
+    // 877 - 689 = 188, half of it 94.
+    test.assert_eq(dhcpclient.client_next_at(var c), 689 + 94)
+
+    test.case("an ACK extends the lease from the time it arrives")
+    var ack = from_server(dhcpmsg.DHCP_ACK, 0x9999, lease_ip(), server_ip(), 2000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 700, var ack, var out), dhcpclient.DHCP_ACT_BOUND)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_BOUND)
+    test.assert_eq(dhcpclient.client_expires_at(var c), 2700)
+    test.assert_eq(dhcpclient.client_t1_at(var c), 1700)
+
+@test
+fn test_the_lease_is_rebound_at_t2_and_ends() [io]
+    var c = bound()
+    var out: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 502, 5, var out)
+
+    test.case("at T2 the client asks any server, by broadcast")
+    test.assert_eq(dhcpclient.client_tick(var c, 877, 6, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REBINDING)
+    test.assert_eq(dhcpmsg.ciaddr(var out), lease_ip())
+    // 1002 - 877 = 125, half of it 62.
+    test.assert_eq(dhcpclient.client_next_at(var c), 877 + 62)
+
+    test.case("it is repeated, and never sooner than 60 seconds")
+    test.assert_eq(dhcpclient.client_tick(var c, 900, 6, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_tick(var c, 939, 6, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_next_at(var c), 939 + 60)
+
+    test.case("an ACK from any server binds")
+    var ack = from_server(dhcpmsg.DHCP_ACK, dhcpmsg.xid(var out), lease_ip(), server_ip() - 2, 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 950, var ack, var out), dhcpclient.DHCP_ACT_BOUND)
+    test.assert_eq(dhcpclient.client_server(var c), server_ip() - 2)
+
+    test.case("with no answer the lease ends and the address must not be used")
+    var d = bound()
+    let _b = dhcpclient.client_tick(var d, 502, 5, var out)
+    let _c = dhcpclient.client_tick(var d, 877, 6, var out)
+    test.assert_eq(dhcpclient.client_tick(var d, 1002, 7, var out), dhcpclient.DHCP_ACT_EXPIRED)
+    test.assert_eq(dhcpclient.client_state(var d), dhcpclient.DHCP_STATE_INIT)
+    test.assert_eq(dhcpclient.client_ip(var d), 0)
+    test.assert(not dhcpclient.client_has_lease(var d))
+    test.assert_eq(dhcpclient.client_remaining(var d, 1002), 0)
+
+@test
+fn test_a_nak_while_renewing_ends_the_lease() [io]
+    var out: Vec[u8; 576] = Vec.new()
+    var c = bound()
+    let _a = dhcpclient.client_tick(var c, 502, 0x31, var out)
+    var nak = from_server(dhcpmsg.DHCP_NAK, 0x31, 0, server_ip(), 0, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 503, var nak, var out), dhcpclient.DHCP_ACT_NAK)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+    test.assert_eq(dhcpclient.client_ip(var c), 0)
+
+@test
+fn test_a_lease_that_never_ends_is_never_renewed() [io]
+    var out: Vec[u8; 576] = Vec.new()
+    var c = requesting()
+    var ack = from_server(dhcpmsg.DHCP_ACK, 0x1234ABCD, lease_ip(), server_ip(), 0xFFFFFFFF, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 2, var ack, var out), dhcpclient.DHCP_ACT_BOUND)
+    test.assert(dhcpclient.client_lease_is_infinite(var c))
+    test.assert_eq(dhcpclient.client_next_at(var c), -1)
+    test.assert_eq(dhcpclient.client_tick(var c, 4000000000, 1, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_BOUND)
+    test.assert(dhcpclient.client_remaining(var c, 4000000000) > 0)
+
+@test
+fn test_an_address_in_use_is_declined() [io]
+    var out: Vec[u8; 576] = Vec.new()
+    var c = bound()
+    test.assert_eq(dhcpclient.client_decline(var c, 3, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_DECLINE)
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_REQUESTED_IP), lease_ip())
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID), server_ip())
+    test.assert_eq(dhcpmsg.validate(var out), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+    test.assert_eq(dhcpclient.client_ip(var c), 0)
+
+    test.case("the client waits ten seconds before it starts again")
+    test.assert_eq(dhcpclient.client_tick(var c, 12, 5, var out), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_tick(var c, 13, 5, var out), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_DISCOVER)
+
+@test
+fn test_a_lease_is_released() [io]
+    var out: Vec[u8; 576] = Vec.new()
+    var c = bound()
+    test.assert_eq(dhcpclient.client_release(var c, 50, var out), dhcpclient.DHCP_ACT_UNICAST)
+    test.assert_eq(dhcpmsg.message_type(var out), dhcpmsg.DHCP_RELEASE)
+    test.assert_eq(dhcpmsg.ciaddr(var out), lease_ip())
+    test.assert_eq(dhcpmsg.option_u32(var out, dhcpmsg.DHCP_OPT_SERVER_ID), server_ip())
+    test.assert_eq(dhcpmsg.validate(var out), dhcpmsg.DHCP_FAULT_NONE)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_INIT)
+
+    test.case("a client with no lease has nothing to release")
+    test.assert_eq(dhcpclient.client_release(var c, 51, var out), dhcpclient.DHCP_ACT_NONE)
+    var fresh = a_client()
+    test.assert_eq(dhcpclient.client_release(var fresh, 0, var out), dhcpclient.DHCP_ACT_NONE)
+
+@test
+fn test_a_client_in_init_waits_for_its_time() [io]
+    var c = a_client()
+    var out: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_decline(var c, 100, var out)
+    test.assert_eq(dhcpclient.client_next_at(var c), 110)
+    test.assert_eq(dhcpclient.client_tick(var c, 109, 5, var out), dhcpclient.DHCP_ACT_NONE)
+
+    test.case("a reply that arrives while the client is in INIT is ignored")
+    var offer = from_server(dhcpmsg.DHCP_OFFER, 0, lease_ip(), server_ip(), 1000, 0, 0)
+    test.assert_eq(dhcpclient.client_receive(var c, 109, var offer, var out), dhcpclient.DHCP_ACT_NONE)

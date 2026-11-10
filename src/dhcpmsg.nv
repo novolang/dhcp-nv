@@ -1,0 +1,596 @@
+// dhcpmsg.nv — the DHCP message of RFC 2131 as bytes in a buffer the
+// caller owns: the fixed header, the magic cookie and the options of
+// RFC 2132, with the option overload of section 9.3 and the long options
+// of RFC 3396.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`.  A message is a
+// `Vec[u8; 576]`, the size RFC 2131 section 3 requires a client to be
+// able to receive, held in the caller's frame.  Nothing here allocates,
+// reads a clock or performs input or output.
+//
+// An address is a `Int` holding the four octets, most significant first:
+// 192.168.1.10 is `0xC0A8010A`.  `ip` builds one from the octets.
+//
+// A reader that is handed a position outside the message answers a
+// value that cannot be a field (-1 for an option, 0 for a header field)
+// and never faults, so a message cut anywhere is read without a check
+// from the caller.
+
+// ── Sizes and numbers the format fixes ──────────────────────────────
+
+// The buffer a message is built in and read from: the 576 bytes every
+// DHCP implementation must accept (RFC 2131 section 3, RFC 791).
+pub const DHCP_MESSAGE_MAX = 576
+
+// The fixed part of the message, up to the magic cookie (RFC 2131
+// figure 1).
+pub const DHCP_HEADER_LEN = 236
+
+// Where the options start: after the header and the four cookie bytes.
+pub const DHCP_OPTIONS_AT = 240
+
+// The length BOOTP relays expect as a minimum (RFC 1542 section 2.1).
+pub const DHCP_MIN_LEN = 300
+
+// The magic cookie that says the options are DHCP's (RFC 2131 section
+// 3).
+pub const DHCP_MAGIC = 0x63825363
+
+// The port a server and a relay listen on, and the port a client does.
+pub const DHCP_SERVER_PORT = 67
+// The UDP port a client listens on.
+pub const DHCP_CLIENT_PORT = 68
+
+// The `op` field: a message from a client, and one from a server.
+pub const DHCP_BOOTREQUEST = 1
+// The `op` field of a message from a server.
+pub const DHCP_BOOTREPLY = 2
+
+// The broadcast bit of the `flags` field (RFC 2131 section 2).  A client
+// that cannot receive a unicast datagram before it is configured sets it
+// so that the server answers to the broadcast address.
+pub const DHCP_FLAG_BROADCAST = 0x8000
+
+// The broadcast address, 255.255.255.255.
+pub const DHCP_BROADCAST = 0xFFFFFFFF
+
+// A lease time that never ends (RFC 2131 section 3.3).
+pub const DHCP_INFINITE = 0xFFFFFFFF
+
+// Hardware type 1: Ethernet, with a six-byte address.
+pub const DHCP_HTYPE_ETHERNET = 1
+
+// Offsets of the header fields.
+const OFF_OP = 0
+const OFF_HTYPE = 1
+const OFF_HLEN = 2
+const OFF_HOPS = 3
+const OFF_XID = 4
+const OFF_SECS = 8
+const OFF_FLAGS = 10
+const OFF_CIADDR = 12
+const OFF_YIADDR = 16
+const OFF_SIADDR = 20
+const OFF_GIADDR = 24
+const OFF_CHADDR = 28
+const OFF_SNAME = 44
+const OFF_FILE = 108
+const OFF_COOKIE = 236
+
+// ── Message types (option 53, RFC 2132 section 9.6) ─────────────────
+
+// DHCPDISCOVER: a client looks for servers.
+pub const DHCP_DISCOVER = 1
+// DHCPOFFER: a server offers an address.
+pub const DHCP_OFFER = 2
+// DHCPREQUEST: a client asks for an offered address, or to extend a lease.
+pub const DHCP_REQUEST = 3
+// DHCPDECLINE: a client reports that an address is in use.
+pub const DHCP_DECLINE = 4
+// DHCPACK: a server grants a lease or confirms a configuration.
+pub const DHCP_ACK = 5
+// DHCPNAK: a server refuses a request.
+pub const DHCP_NAK = 6
+// DHCPRELEASE: a client gives its lease back.
+pub const DHCP_RELEASE = 7
+// DHCPINFORM: a client that has an address asks for the rest of the configuration.
+pub const DHCP_INFORM = 8
+
+// ── Option codes (RFC 2132) ─────────────────────────────────────────
+
+// Option 0 pads, and option 255 ends the options.
+pub const DHCP_OPT_PAD = 0
+// Option 255 ends the options.
+pub const DHCP_OPT_END = 255
+
+// Option 1: the subnet mask, four bytes.
+pub const DHCP_OPT_SUBNET_MASK = 1
+// Option 3: the routers, a list of addresses.
+pub const DHCP_OPT_ROUTER = 3
+// Option 6: the DNS servers, a list of addresses.
+pub const DHCP_OPT_DNS = 6
+// Option 12: the host name.
+pub const DHCP_OPT_HOSTNAME = 12
+// Option 15: the domain name.
+pub const DHCP_OPT_DOMAIN_NAME = 15
+// Option 28: the broadcast address of the subnet.
+pub const DHCP_OPT_BROADCAST = 28
+// Option 42: the NTP servers, a list of addresses.
+pub const DHCP_OPT_NTP = 42
+// Option 50: the address a client asks for.
+pub const DHCP_OPT_REQUESTED_IP = 50
+// Option 51: the lease time in seconds, four bytes.
+pub const DHCP_OPT_LEASE_TIME = 51
+// Option 52: which of the `file` and `sname` fields hold options.
+pub const DHCP_OPT_OVERLOAD = 52
+// Option 53: the message type, one byte.
+pub const DHCP_OPT_MESSAGE_TYPE = 53
+// Option 54: the address that identifies a server.
+pub const DHCP_OPT_SERVER_ID = 54
+// Option 55: the options a client asks for, one code per byte.
+pub const DHCP_OPT_PARAMETER_LIST = 55
+// Option 56: a message in words, from a server.
+pub const DHCP_OPT_MESSAGE = 56
+// Option 57: the largest message the sender accepts, two bytes.
+pub const DHCP_OPT_MAX_MESSAGE = 57
+// Option 58: T1, the time until renewal, in seconds.
+pub const DHCP_OPT_RENEWAL = 58
+// Option 59: T2, the time until rebinding, in seconds.
+pub const DHCP_OPT_REBINDING = 59
+// Option 60: the vendor class identifier.
+pub const DHCP_OPT_VENDOR_CLASS = 60
+// Option 61: the client identifier.
+pub const DHCP_OPT_CLIENT_ID = 61
+
+// ── Faults ──────────────────────────────────────────────────────────
+
+// A message that can be used.
+pub const DHCP_FAULT_NONE = 0
+// Fewer than the 241 bytes a header, a cookie and one option need.
+pub const DHCP_FAULT_SHORT = 1
+// An `op` that is neither 1 nor 2.
+pub const DHCP_FAULT_OP = 2
+// A hardware address longer than the sixteen bytes the field holds.
+pub const DHCP_FAULT_HLEN = 3
+// The four bytes after the header are not the magic cookie.
+pub const DHCP_FAULT_COOKIE = 4
+// No message type option: the message is BOOTP.
+pub const DHCP_FAULT_NO_TYPE = 5
+// An option that runs past the end of the area that holds it.
+pub const DHCP_FAULT_OPTION = 6
+
+// The words for a fault, for a log line.
+pub @tier(embedded)
+@no_alloc
+fn fault_name(fault: Int) -> Str
+    if fault == DHCP_FAULT_NONE
+        "no fault"
+    elif fault == DHCP_FAULT_SHORT
+        "the message is shorter than a header, a cookie and an option"
+    elif fault == DHCP_FAULT_OP
+        "op is neither 1 nor 2"
+    elif fault == DHCP_FAULT_HLEN
+        "hlen is more than 16"
+    elif fault == DHCP_FAULT_COOKIE
+        "the magic cookie is wrong"
+    elif fault == DHCP_FAULT_NO_TYPE
+        "no DHCP message type option"
+    elif fault == DHCP_FAULT_OPTION
+        "an option runs past the end of its area"
+    else
+        "unknown fault"
+
+// The name of a message type.
+pub @tier(embedded)
+@no_alloc
+fn type_name(t: Int) -> Str
+    if t == DHCP_DISCOVER
+        "DHCPDISCOVER"
+    elif t == DHCP_OFFER
+        "DHCPOFFER"
+    elif t == DHCP_REQUEST
+        "DHCPREQUEST"
+    elif t == DHCP_DECLINE
+        "DHCPDECLINE"
+    elif t == DHCP_ACK
+        "DHCPACK"
+    elif t == DHCP_NAK
+        "DHCPNAK"
+    elif t == DHCP_RELEASE
+        "DHCPRELEASE"
+    elif t == DHCP_INFORM
+        "DHCPINFORM"
+    else
+        "unknown message type"
+
+// ── Addresses ───────────────────────────────────────────────────────
+
+// An address from its four octets.  Each is reduced to its low eight
+// bits.
+pub @tier(embedded)
+@no_alloc
+fn ip(a: Int, b: Int, c: Int, d: Int) -> Int
+    ((a & 255) << 24) | ((b & 255) << 16) | ((c & 255) << 8) | (d & 255)
+
+// The octet of an address that is `n` places from the left, 0 to 3.
+pub @tier(embedded)
+@no_alloc
+fn ip_octet(addr: Int, n: Int) -> Int
+    (addr >> (24 - 8 * n)) & 255
+
+// ── Reading the header ──────────────────────────────────────────────
+
+// The byte at `at`, or 0 when the message does not reach it.
+@tier(embedded)
+@no_alloc
+fn get8(var m: Vec[u8; 576], at: Int) -> Int
+    if at < 0 or at >= m.len()
+        0
+    else
+        m[at] as Int
+
+@tier(embedded)
+@no_alloc
+fn get16(var m: Vec[u8; 576], at: Int) -> Int
+    (get8(var m, at) << 8) | get8(var m, at + 1)
+
+@tier(embedded)
+@no_alloc
+fn get32(var m: Vec[u8; 576], at: Int) -> Int
+    (get16(var m, at) << 16) | get16(var m, at + 2)
+
+// The `op` field: 1 for a message from a client, 2 for one from a
+// server.
+pub @tier(embedded)
+@no_alloc
+fn op(var m: Vec[u8; 576]) -> Int
+    get8(var m, OFF_OP)
+
+// The hardware address type.
+pub @tier(embedded)
+@no_alloc
+fn htype(var m: Vec[u8; 576]) -> Int
+    get8(var m, OFF_HTYPE)
+
+// The length of the client's hardware address.
+pub @tier(embedded)
+@no_alloc
+fn hlen(var m: Vec[u8; 576]) -> Int
+    get8(var m, OFF_HLEN)
+
+// The relay hop count.
+pub @tier(embedded)
+@no_alloc
+fn hops(var m: Vec[u8; 576]) -> Int
+    get8(var m, OFF_HOPS)
+
+// The transaction identifier, which a server copies into its replies.
+pub @tier(embedded)
+@no_alloc
+fn xid(var m: Vec[u8; 576]) -> Int
+    get32(var m, OFF_XID)
+
+// Seconds since the client began acquiring or renewing.
+pub @tier(embedded)
+@no_alloc
+fn secs(var m: Vec[u8; 576]) -> Int
+    get16(var m, OFF_SECS)
+
+// The flags field.
+pub @tier(embedded)
+@no_alloc
+fn flags(var m: Vec[u8; 576]) -> Int
+    get16(var m, OFF_FLAGS)
+
+// The client's own address, when it has one that it can answer ARP for.
+pub @tier(embedded)
+@no_alloc
+fn ciaddr(var m: Vec[u8; 576]) -> Int
+    get32(var m, OFF_CIADDR)
+
+// "Your" address: what the server offers or assigns.
+pub @tier(embedded)
+@no_alloc
+fn yiaddr(var m: Vec[u8; 576]) -> Int
+    get32(var m, OFF_YIADDR)
+
+// The next server to use in bootstrap.
+pub @tier(embedded)
+@no_alloc
+fn siaddr(var m: Vec[u8; 576]) -> Int
+    get32(var m, OFF_SIADDR)
+
+// The relay agent's address.
+pub @tier(embedded)
+@no_alloc
+fn giaddr(var m: Vec[u8; 576]) -> Int
+    get32(var m, OFF_GIADDR)
+
+// Byte `i` of the client's hardware address, or 0 past its length.
+pub @tier(embedded)
+@no_alloc
+fn chaddr_byte(var m: Vec[u8; 576], i: Int) -> Int
+    if i < 0 or i >= hlen(var m) or i >= 16
+        0
+    else
+        get8(var m, OFF_CHADDR + i)
+
+// ── Options ─────────────────────────────────────────────────────────
+
+// What a walk over the options leaves behind.
+//
+// `seen` counts the bytes of the wanted option met so far, over all its
+// instances, which is how an option split in pieces is read as one
+// value (RFC 3396).  `byte` is the byte that was asked for, or -1.
+// `found` counts the instances of the option, so that an option of zero
+// length is told from an option that is absent.  `overload` is the value
+// of option 52, or 0.  `bad` is 1 when an option ran past the end of its
+// area.
+pub @value
+struct DhcpScan
+    seen: Int
+    found: Int
+    byte: Int
+    overload: Int
+    bad: Int
+
+// One area of options, from `from` to `to`, searched for `code`.
+//
+// `want` is the position in the concatenated value of the byte to
+// capture, or -1 to count only.  The walk stops at an END option, at
+// the end of the area, or at an option that does not fit.
+@tier(embedded)
+@no_alloc
+fn scan_area(var m: Vec[u8; 576], from: Int, to: Int, code: Int, want: Int, var st: DhcpScan)
+    var pos = from
+    var live = true
+    for _ in 0..DHCP_MESSAGE_MAX
+        if live and pos < to
+            let c = get8(var m, pos)
+            if c == DHCP_OPT_END
+                live = false
+            elif c == DHCP_OPT_PAD
+                pos = pos + 1
+            elif pos + 1 >= to
+                st.bad = 1
+                live = false
+            else
+                let len = get8(var m, pos + 1)
+                if pos + 2 + len > to
+                    st.bad = 1
+                    live = false
+                else
+                    if c == DHCP_OPT_OVERLOAD and len == 1
+                        st.overload = get8(var m, pos + 2)
+                    if c == code
+                        st.found = st.found + 1
+                        if want >= st.seen and want < st.seen + len
+                            st.byte = get8(var m, pos + 2 + want - st.seen)
+                        st.seen = st.seen + len
+                    pos = pos + 2 + len
+
+// Walk every area that holds options, in the order RFC 2131 section 4.1
+// and RFC 2132 section 9.3 give: the options field, then `file` and
+// `sname` when option 52 says they hold options too.
+@tier(embedded)
+@no_alloc
+fn scan(var m: Vec[u8; 576], code: Int, want: Int, var st: DhcpScan)
+    st.seen = 0
+    st.found = 0
+    st.byte = -1
+    st.overload = 0
+    st.bad = 0
+    scan_area(var m, DHCP_OPTIONS_AT, m.len(), code, want, var st)
+    if st.overload == 1 or st.overload == 3
+        scan_area(var m, OFF_FILE, OFF_COOKIE, code, want, var st)
+    if st.overload == 2 or st.overload == 3
+        scan_area(var m, OFF_SNAME, OFF_FILE, code, want, var st)
+
+// A scan that has not yet started.
+@tier(embedded)
+@no_alloc
+fn fresh_scan() -> DhcpScan
+    DhcpScan { seen: 0, found: 0, byte: -1, overload: 0, bad: 0 }
+
+// The length of option `code`, with every instance of it joined, or -1
+// when the message has none.  An option present with no data has length
+// 0.
+pub @tier(embedded)
+@no_alloc
+fn option_len(var m: Vec[u8; 576], code: Int) -> Int
+    var st = fresh_scan()
+    scan(var m, code, -1, var st)
+    if st.found > 0
+        st.seen
+    else
+        -1
+
+// Byte `index` of option `code`, counting across all its instances, or
+// -1 when there is no such byte.
+pub @tier(embedded)
+@no_alloc
+fn option_byte(var m: Vec[u8; 576], code: Int, index: Int) -> Int
+    var st = fresh_scan()
+    if index < 0
+        -1
+    else
+        scan(var m, code, index, var st)
+        st.byte
+
+// Whether an option ran past the end of the area that holds it.
+pub @tier(embedded)
+@no_alloc
+fn options_malformed(var m: Vec[u8; 576]) -> Bool
+    var st = fresh_scan()
+    scan(var m, DHCP_OPT_END, -1, var st)
+    st.bad == 1
+
+// An option that is one byte, or -1.
+pub @tier(embedded)
+@no_alloc
+fn option_u8(var m: Vec[u8; 576], code: Int) -> Int
+    if option_len(var m, code) == 1
+        option_byte(var m, code, 0)
+    else
+        -1
+
+// An option that is four bytes, a 32-bit number or an address, or -1.
+pub @tier(embedded)
+@no_alloc
+fn option_u32(var m: Vec[u8; 576], code: Int) -> Int
+    if option_len(var m, code) == 4
+        (option_byte(var m, code, 0) << 24) | (option_byte(var m, code, 1) << 16) | (option_byte(var m, code, 2) << 8) | option_byte(var m, code, 3)
+    else
+        -1
+
+// The `n`-th address of an option that is a list of addresses, as the
+// router and DNS server options are, or -1 when the list is shorter or
+// its length is not a multiple of four.
+pub @tier(embedded)
+@no_alloc
+fn option_ip(var m: Vec[u8; 576], code: Int, n: Int) -> Int
+    let len = option_len(var m, code)
+    if len < 4 or len % 4 != 0 or n < 0 or n * 4 + 4 > len
+        -1
+    else
+        (option_byte(var m, code, n * 4) << 24) | (option_byte(var m, code, n * 4 + 1) << 16) | (option_byte(var m, code, n * 4 + 2) << 8) | option_byte(var m, code, n * 4 + 3)
+
+// The message type, option 53, or -1.
+pub @tier(embedded)
+@no_alloc
+fn message_type(var m: Vec[u8; 576]) -> Int
+    option_u8(var m, DHCP_OPT_MESSAGE_TYPE)
+
+// Whether a received message can be used, and if not, why: one of the
+// `DHCP_FAULT_*` numbers.  The first four checks are the header's; the
+// last two are the options'.
+pub @tier(embedded)
+@no_alloc
+fn validate(var m: Vec[u8; 576]) -> Int
+    if m.len() < DHCP_OPTIONS_AT + 1
+        DHCP_FAULT_SHORT
+    elif op(var m) != DHCP_BOOTREQUEST and op(var m) != DHCP_BOOTREPLY
+        DHCP_FAULT_OP
+    elif hlen(var m) > 16
+        DHCP_FAULT_HLEN
+    elif get32(var m, OFF_COOKIE) != DHCP_MAGIC
+        DHCP_FAULT_COOKIE
+    elif options_malformed(var m)
+        DHCP_FAULT_OPTION
+    elif message_type(var m) < 1
+        DHCP_FAULT_NO_TYPE
+    else
+        DHCP_FAULT_NONE
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// Append one byte.  Answers false when the buffer is full, and then the
+// message built so far is incomplete and must be discarded.
+@tier(embedded)
+@no_alloc
+fn put8(var m: Vec[u8; 576], v: Int) -> Bool
+    match m.push((v & 255) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+@tier(embedded)
+@no_alloc
+fn put16(var m: Vec[u8; 576], v: Int) -> Bool
+    put8(var m, v >> 8) and put8(var m, v)
+
+@tier(embedded)
+@no_alloc
+fn put32(var m: Vec[u8; 576], v: Int) -> Bool
+    put16(var m, v >> 16) and put16(var m, v)
+
+// Overwrite the byte at `at`, which the message already holds.
+@tier(embedded)
+@no_alloc
+fn set8(var m: Vec[u8; 576], at: Int, v: Int)
+    m[at] = (v & 255) as u8
+
+@tier(embedded)
+@no_alloc
+fn set16(var m: Vec[u8; 576], at: Int, v: Int)
+    set8(var m, at, v >> 8)
+    set8(var m, at + 1, v)
+
+@tier(embedded)
+@no_alloc
+fn set32(var m: Vec[u8; 576], at: Int, v: Int)
+    set16(var m, at, v >> 16)
+    set16(var m, at + 2, v)
+
+// Start a message: clear the buffer, write the 236 bytes of header with
+// the fields given and zero elsewhere, and write the magic cookie.
+// `mac` is the client's hardware address, one to sixteen bytes; it is
+// copied into `chaddr` and its length into `hlen`.
+//
+// Answers false when `mac` is longer than sixteen bytes.
+pub @tier(embedded)
+@no_alloc
+fn begin(var m: Vec[u8; 576], kind: Int, hardware_type: Int, var mac: Vec[u8; 16], txid: Int,
+         elapsed: Int, flag_bits: Int, client_ip: Int, your_ip: Int, relay_ip: Int) -> Bool
+    m.clear()
+    for _ in 0..DHCP_HEADER_LEN
+        let _p = put8(var m, 0)
+    set8(var m, OFF_OP, kind)
+    set8(var m, OFF_HTYPE, hardware_type)
+    set8(var m, OFF_HLEN, mac.len())
+    set32(var m, OFF_XID, txid)
+    set16(var m, OFF_SECS, elapsed)
+    set16(var m, OFF_FLAGS, flag_bits)
+    set32(var m, OFF_CIADDR, client_ip)
+    set32(var m, OFF_YIADDR, your_ip)
+    set32(var m, OFF_GIADDR, relay_ip)
+    for i in 0..mac.len()
+        set8(var m, OFF_CHADDR + i, mac[i] as Int)
+    put32(var m, DHCP_MAGIC)
+
+// Append an option of one byte.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u8(var m: Vec[u8; 576], code: Int, v: Int) -> Bool
+    put8(var m, code) and put8(var m, 1) and put8(var m, v)
+
+// Append an option of two bytes.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u16(var m: Vec[u8; 576], code: Int, v: Int) -> Bool
+    put8(var m, code) and put8(var m, 2) and put16(var m, v)
+
+// Append an option of four bytes: a 32-bit number or an address.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u32(var m: Vec[u8; 576], code: Int, v: Int) -> Bool
+    put8(var m, code) and put8(var m, 4) and put32(var m, v)
+
+// Append an option made of the bytes of `data`, which may be empty.
+pub @tier(embedded)
+@no_alloc
+fn put_option_bytes(var m: Vec[u8; 576], code: Int, var data: Vec[u8; 32]) -> Bool
+    var ok = put8(var m, code) and put8(var m, data.len())
+    for i in 0..data.len()
+        ok = ok and put8(var m, data[i] as Int)
+    ok
+
+// Append the END option and pad the message to 300 bytes, the shortest
+// a BOOTP relay will forward.  Answers false when the buffer is full.
+pub @tier(embedded)
+@no_alloc
+fn finish(var m: Vec[u8; 576]) -> Bool
+    var ok = put8(var m, DHCP_OPT_END)
+    for _ in 0..DHCP_MIN_LEN
+        if ok and m.len() < DHCP_MIN_LEN
+            ok = put8(var m, DHCP_OPT_PAD)
+    ok
+
+// Copy the client's hardware address out of a received message into
+// `mac`, replacing what it held.
+pub @tier(embedded)
+@no_alloc
+fn read_chaddr(var m: Vec[u8; 576], var mac: Vec[u8; 16])
+    mac.clear()
+    for i in 0..hlen(var m)
+        if i < 16
+            let _p = mac.push(get8(var m, OFF_CHADDR + i) as u8)

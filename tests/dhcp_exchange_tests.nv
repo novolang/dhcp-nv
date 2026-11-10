@@ -1,0 +1,182 @@
+// dhcp_exchange_tests.nv — the client against the server, with a clock,
+// a lost datagram and a message damaged at every byte.
+//
+// The network is the test: whatever one side writes is what the other
+// is handed, unless the test drops it.
+
+use std.test
+use dhcpmsg
+use dhcpclient
+use dhcpserver
+
+fn a_server() -> DhcpServer
+    dhcpserver.server_new(dhcpmsg.ip(172, 16, 0, 1),
+        dhcpmsg.ip(255, 255, 0, 0),
+        dhcpmsg.ip(172, 16, 0, 1),
+        dhcpmsg.ip(172, 16, 0, 2),
+        600,
+        dhcpmsg.ip(172, 16, 1, 10),
+        8)
+
+fn a_client(last: Int) -> DhcpClient
+    var mac: Vec[u8; 16] = Vec.new()
+    for b in [0x52, 0x54, 0x00, 0x12, 0x34, last]
+        let _p = mac.push(b as u8)
+    dhcpclient.client_new(var mac, 1, false)
+
+// One round trip at `now`: the client's datagram goes to the server and
+// the answer comes back.  Answers the client's last action.
+fn deliver(var c: DhcpClient, var s: DhcpServer, var wire: Vec[u8; 576], now: Int) -> Int
+    var answer: Vec[u8; 576] = Vec.new()
+    var next: Vec[u8; 576] = Vec.new()
+    let a = dhcpserver.server_handle(var s, var wire, var answer, now)
+    var act = dhcpclient.DHCP_ACT_NONE
+    if a.action == dhcpserver.DHCP_SEND_REPLY
+        act = dhcpclient.client_receive(var c, now, var answer, var next)
+        wire.clear()
+        for i in 0..next.len()
+            let _p = wire.push(next[i])
+    act
+
+@test
+fn test_a_client_acquires_renews_and_releases() [io]
+    var s = a_server()
+    var c = a_client(1)
+    var wire: Vec[u8; 576] = Vec.new()
+
+    test.case("discover, offer, request, acknowledgement")
+    test.assert_eq(dhcpclient.client_tick(var c, 0, 0xCAFE0001, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(deliver(var c, var s, var wire, 0), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REQUESTING)
+    test.assert_eq(deliver(var c, var s, var wire, 0), dhcpclient.DHCP_ACT_BOUND)
+    test.assert_eq(dhcpclient.client_ip(var c), dhcpmsg.ip(172, 16, 1, 10))
+    test.assert_eq(c.mask, dhcpmsg.ip(255, 255, 0, 0))
+    test.assert_eq(c.router, dhcpmsg.ip(172, 16, 0, 1))
+    test.assert_eq(c.dns1, dhcpmsg.ip(172, 16, 0, 2))
+    test.assert_eq(dhcpclient.client_server(var c), dhcpmsg.ip(172, 16, 0, 1))
+
+    test.case("at T1 the lease is renewed by the same server")
+    test.assert_eq(dhcpclient.client_next_at(var c), 300)
+    test.assert_eq(dhcpclient.client_tick(var c, 300, 0xCAFE0002, var wire), dhcpclient.DHCP_ACT_UNICAST)
+    test.assert_eq(deliver(var c, var s, var wire, 300), dhcpclient.DHCP_ACT_BOUND)
+    test.assert_eq(dhcpclient.client_expires_at(var c), 900)
+    test.assert_eq(dhcpclient.client_ip(var c), dhcpmsg.ip(172, 16, 1, 10))
+
+    test.case("a release returns the address to the pool")
+    test.assert_eq(dhcpclient.client_release(var c, 400, var wire), dhcpclient.DHCP_ACT_UNICAST)
+    let _r = deliver(var c, var s, var wire, 400)
+    test.assert_eq(dhcpserver.server_free_count(var s, 400), 8)
+
+@test
+fn test_a_lost_datagram_is_sent_again() [io]
+    var s = a_server()
+    var c = a_client(2)
+    var wire: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, 0xCAFE0001, var wire)
+    // The DISCOVER is lost.  Four seconds later the client sends it again.
+    test.assert_eq(dhcpclient.client_tick(var c, 3, 0xCAFE0001, var wire), dhcpclient.DHCP_ACT_NONE)
+    test.assert_eq(dhcpclient.client_tick(var c, 4, 0xCAFE0001, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(deliver(var c, var s, var wire, 4), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(deliver(var c, var s, var wire, 4), dhcpclient.DHCP_ACT_BOUND)
+
+@test
+fn test_a_server_that_goes_away_ends_the_lease() [io]
+    var s = a_server()
+    var c = a_client(3)
+    var wire: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, 0xCAFE0004, var wire)
+    let _b = deliver(var c, var s, var wire, 0)
+    let _c = deliver(var c, var s, var wire, 0)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_BOUND)
+
+    // T1 is 300, T2 is 525 and the lease ends at 600; nobody answers.
+    test.assert_eq(dhcpclient.client_tick(var c, 300, 1, var wire), dhcpclient.DHCP_ACT_UNICAST)
+    test.assert_eq(dhcpclient.client_tick(var c, 525, 2, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(dhcpclient.client_state(var c), dhcpclient.DHCP_STATE_REBINDING)
+    test.assert_eq(dhcpclient.client_tick(var c, 600, 3, var wire), dhcpclient.DHCP_ACT_EXPIRED)
+    test.assert_eq(dhcpclient.client_ip(var c), 0)
+
+    test.case("and the client finds a new lease from the start")
+    test.assert_eq(dhcpclient.client_tick(var c, 600, 0xCAFE0005, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(deliver(var c, var s, var wire, 600), dhcpclient.DHCP_ACT_BROADCAST)
+    test.assert_eq(deliver(var c, var s, var wire, 600), dhcpclient.DHCP_ACT_BOUND)
+
+@test
+fn test_two_clients_get_two_addresses() [io]
+    var s = a_server()
+    var a = a_client(4)
+    var b = a_client(5)
+    var wire: Vec[u8; 576] = Vec.new()
+    let _1 = dhcpclient.client_tick(var a, 0, 0x11, var wire)
+    let _2 = deliver(var a, var s, var wire, 0)
+    let _3 = deliver(var a, var s, var wire, 0)
+    let _4 = dhcpclient.client_tick(var b, 0, 0x22, var wire)
+    let _5 = deliver(var b, var s, var wire, 0)
+    let _6 = deliver(var b, var s, var wire, 0)
+    test.assert(dhcpclient.client_ip(var a) != 0)
+    test.assert(dhcpclient.client_ip(var b) != 0)
+    test.assert(dhcpclient.client_ip(var a) != dhcpclient.client_ip(var b))
+
+@test
+fn test_a_client_declines_an_address_a_neighbour_holds() [io]
+    var s = a_server()
+    var c = a_client(6)
+    var wire: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, 0x33, var wire)
+    let _b = deliver(var c, var s, var wire, 0)
+    let _c = deliver(var c, var s, var wire, 0)
+    let held = dhcpclient.client_ip(var c)
+    test.assert_eq(dhcpclient.client_decline(var c, 1, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    let _d = deliver(var c, var s, var wire, 1)
+    test.assert_eq(dhcpserver.server_slot_state(var s, held), dhcpserver.DHCP_SLOT_DECLINED)
+
+    test.case("the next offer is a different address")
+    test.assert_eq(dhcpclient.client_tick(var c, 11, 0x34, var wire), dhcpclient.DHCP_ACT_BROADCAST)
+    let _e = deliver(var c, var s, var wire, 11)
+    let _f = deliver(var c, var s, var wire, 11)
+    test.assert(dhcpclient.client_ip(var c) != held)
+    test.assert(dhcpclient.client_ip(var c) != 0)
+
+@test
+fn test_a_message_damaged_at_any_byte_does_not_fault() [io]
+    // A request, a reply, and the client's DISCOVER, each with every byte
+    // set to 0x00, 0x7F and 0xFF in turn.  Reading, validating and
+    // answering them must neither trap nor loop.
+    var s = a_server()
+    var c = a_client(7)
+    var wire: Vec[u8; 576] = Vec.new()
+    let _a = dhcpclient.client_tick(var c, 0, 0x44, var wire)
+    var reply: Vec[u8; 576] = Vec.new()
+    let _b = dhcpserver.server_handle(var s, var wire, var reply, 0)
+    var damaged: Vec[u8; 576] = Vec.new()
+    var out: Vec[u8; 576] = Vec.new()
+    var answered = 0
+    for fill in [0, 127, 255]
+        for i in 0..reply.len()
+            damaged.clear()
+            for k in 0..reply.len()
+                let _p = damaged.push(reply[k])
+            damaged[i] = fill as u8
+            var probe = a_client(7)
+            let _t = dhcpclient.client_tick(var probe, 0, 0x44, var out)
+            let r = dhcpclient.client_receive(var probe, 1, var damaged, var out)
+            if r != dhcpclient.DHCP_ACT_NONE
+                answered = answered + 1
+            let _f = dhcpmsg.validate(var damaged)
+            let _h = dhcpserver.server_handle(var s, var damaged, var out, 2)
+    // Most damaged replies are still a reply to the right exchange.
+    test.assert(answered > 0)
+    test.assert(answered < 3 * reply.len())
+
+    test.case("the same for a request")
+    var req_count = 0
+    for i in 0..wire.len()
+        damaged.clear()
+        for k in 0..wire.len()
+            let _p = damaged.push(wire[k])
+        damaged[i] = 0xFF as u8
+        let h = dhcpserver.server_handle(var s, var damaged, var out, 3)
+        if h.action == dhcpserver.DHCP_SEND_REPLY
+            req_count = req_count + 1
+    test.assert(req_count > 0)
+    test.assert(req_count < wire.len())
